@@ -10,14 +10,15 @@ from .errors import (
     NestedStepError,
     NonDeterminismError,
     RewindableError,
+    RunLocked,
     RunNotFound,
     WorkflowNotFound,
 )
 from .models import AnthropicModel, Model, OpenAICompatModel, ScriptedModel, call, calls, text_of
-from .runtime import Approval, Budget, Context, Engine, RunResult
+from .runtime import Approval, Budget, Context, Engine, RunResult, StepInfo, current_step
 from .store import Store
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Agent",
@@ -33,14 +34,17 @@ __all__ = [
     "NonDeterminismError",
     "OpenAICompatModel",
     "RewindableError",
+    "RunLocked",
     "RunNotFound",
     "RunResult",
     "ScriptedModel",
+    "StepInfo",
     "Store",
     "Tool",
     "WorkflowNotFound",
     "call",
     "calls",
+    "current_step",
     "text_of",
     "tool",
 ]

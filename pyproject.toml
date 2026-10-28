@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rewindable"
-version = "0.1.0"
+version = "0.2.0"
 description = "Crash-proof, resumable, rewindable AI agent workflows. Every model call and tool call is a journaled step: resume after a crash without paying twice, pause for human approval, and rewind to any step."
 readme = "README.md"
 license = "MIT"

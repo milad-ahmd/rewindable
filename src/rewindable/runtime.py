@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import importlib
 import importlib.util
 import inspect
 import json
+import os
+import socket
 import sys
 import threading
 import time
@@ -22,6 +25,7 @@ from .errors import (
     BudgetExceeded,
     NestedStepError,
     NonDeterminismError,
+    RunLocked,
     Suspended,
     WorkflowNotFound,
 )
@@ -31,6 +35,33 @@ if TYPE_CHECKING:
     from .models import Model
 
 Workflow = Callable[..., Any]
+
+# Timers this close to due are slept in-process instead of suspending the run.
+INLINE_SLEEP_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class StepInfo:
+    """Where the code calling :func:`current_step` is running."""
+
+    run_id: str
+    key: str
+    name: str
+    attempt: int
+
+    @property
+    def idempotency_key(self) -> str:
+        """Stable across retries, crashes and resumes; unique per step of a run.
+        Pass it to payment, email or ticketing APIs so a re-executed step is a no-op."""
+        return f"{self.run_id}:{self.key}"
+
+
+_current_step: contextvars.ContextVar[StepInfo | None] = contextvars.ContextVar("rewindable_step", default=None)
+
+
+def current_step() -> StepInfo | None:
+    """The step currently executing in this thread, or None outside a step."""
+    return _current_step.get()
 
 
 @dataclass
@@ -71,6 +102,7 @@ class RunResult:
     output: Any = None
     error: str | None = None
     waiting_for: list[str] = field(default_factory=list)
+    wake_at: float | None = None
     executed_steps: int = 0
     replayed_steps: int = 0
     saved_usd: float = 0.0
@@ -84,6 +116,8 @@ class RunResult:
         bits = [f"run_id={self.run_id!r}", f"status={self.status!r}"]
         if self.waiting_for:
             bits.append(f"waiting_for={self.waiting_for!r}")
+        if self.wake_at:
+            bits.append(f"wake_in={max(0.0, self.wake_at - time.time()):.0f}s")
         if self.error:
             bits.append(f"error={self.error.strip().splitlines()[-1]!r}")
         bits.append(f"executed={self.executed_steps} replayed={self.replayed_steps}")
@@ -187,6 +221,7 @@ class Context:
         while True:
             attempt += 1
             self._local.in_step = True
+            token = _current_step.set(StepInfo(self.run_id, key, name, attempt))
             try:
                 value = fn(*args, **(kwargs or {}))
                 output = json.loads(dumps(value))
@@ -197,6 +232,7 @@ class Context:
                 self._store.fail_step(self.run_id, key, _format_exc(exc), attempts=attempt)
                 raise
             finally:
+                _current_step.reset(token)
                 self._local.in_step = False
             break
 
@@ -252,40 +288,90 @@ class Context:
 
     # -- signals and humans -------------------------------------------------
 
-    def wait_for(self, signal: str, prompt: str | None = None) -> Any:
+    def wait_for(
+        self,
+        signal: str,
+        prompt: str | None = None,
+        *,
+        timeout: float | None = None,
+        default: Any = None,
+    ) -> Any:
         """Pause the run until ``signal`` is delivered, then return its payload.
 
         The first time this is reached without a payload, the run is saved as
         ``waiting`` and the process is free to exit. Deliver the payload with
-        ``engine.signal(...)`` or ``rewindable signal`` and resume the run.
+        ``engine.signal(...)`` or ``rewindable signal``; the CLI and ``rewindable
+        worker`` resume the run. With ``timeout`` (seconds, counted from the first
+        time the run asked), ``default`` is returned if nobody answers in time.
         """
         name = f"signal:{signal}"
         key = self._next_key()
         rec = self._replay(key, name, "signal")
         if rec is not None:
             return rec.output
-        delivered = self._store.get_signal(self.run_id, signal)
-        if delivered is not None and delivered.delivered_at is not None:
-            self._store.begin_step(self.run_id, key, name, "signal")
-            self._store.complete_step(self.run_id, key, delivered.payload)
-            with self._stats.lock:
-                self._stats.executed += 1
-            return delivered.payload
+        found = self._store.get_signal(self.run_id, signal)
+        if found is not None and found.delivered_at is not None:
+            return self._finish_signal(key, name, signal, found.payload)
         self._store.request_signal(self.run_id, signal, prompt)
-        raise Suspended([signal])
+        if timeout is None:
+            raise Suspended([signal])
+        requested_at = self._store.get_signal(self.run_id, signal).requested_at or time.time()
+        deadline = requested_at + timeout
+        if time.time() >= deadline:
+            self._store.deliver_signal(self.run_id, signal, default)
+            return self._finish_signal(key, name, signal, default)
+        raise Suspended([signal], wake_at=deadline)
 
-    def approve(self, question: str, *, key: str | None = None) -> Approval:
+    def _finish_signal(self, key: str, name: str, signal: str, payload: Any) -> Any:
+        self._store.begin_step(self.run_id, key, name, "signal")
+        self._store.complete_step(self.run_id, key, payload)
+        self._store.consume_signal(self.run_id, signal)
+        with self._stats.lock:
+            self._stats.executed += 1
+        return payload
+
+    def approve(self, question: str, *, key: str | None = None, timeout: float | None = None) -> Approval:
         """Ask a human to approve something. Suspends the run until they answer.
 
         ``key`` defaults to one derived from this call's position in the
-        workflow, which is stable across replays.
+        workflow, which is stable across replays. With ``timeout`` (seconds), an
+        unanswered request counts as rejected once it expires.
         """
         with self._counter_lock:
             position = f"{self._prefix}{self._counter + 1}"
-        payload = self.wait_for(key or f"approve-{position}", prompt=question)
+        payload = self.wait_for(
+            key or f"approve-{position}",
+            prompt=question,
+            timeout=timeout,
+            default={"approved": False, "note": "no answer before the timeout"},
+        )
         if isinstance(payload, dict):
             return Approval(bool(payload.get("approved")), str(payload.get("note") or ""))
         return Approval(bool(payload))
+
+    def sleep(self, seconds: float) -> None:
+        """A durable timer. Short waits sleep in-process; longer ones save the run as
+        ``waiting`` with a wake-up time and let the process exit. ``rewindable worker``
+        resumes it when the time comes, even after a reboot."""
+        name = f"sleep:{seconds:g}s"
+        key = self._next_key()
+        if self._replay(key, name, "timer") is not None:
+            return
+        rec = self._store.get_step(self.run_id, key)
+        if rec is not None and rec.kind == "timer" and rec.status == "running" and isinstance(rec.output, dict):
+            wake_at = float(rec.output["wake_at"])
+        else:
+            wake_at = time.time() + seconds
+            self._store.begin_step(self.run_id, key, name, "timer")
+            self._store.set_step_output(self.run_id, key, {"wake_at": wake_at})
+        remaining = wake_at - time.time()
+        if remaining > INLINE_SLEEP_SECONDS:
+            raise Suspended([], wake_at=wake_at)
+        if remaining > 0:
+            time.sleep(remaining)
+        self._store.complete_step(self.run_id, key, {"wake_at": wake_at})
+        with self._stats.lock:
+            self._stats.executed += 1
 
     # -- fan-out -----------------------------------------------------------
 
@@ -319,6 +405,8 @@ class Context:
 
         results: list[Any] = [None] * len(branches)
         waiting: list[str] = []
+        wake_times: list[float] = []
+        suspended = False
         errors: list[BaseException] = []
         with ThreadPoolExecutor(max_workers=max_workers or min(8, len(branches))) as pool:
             futures = [pool.submit(run_branch, i, b) for i, b in enumerate(branches)]
@@ -326,14 +414,17 @@ class Context:
                 try:
                     results[i] = future.result()
                 except Suspended as s:
+                    suspended = True
                     waiting.extend(s.keys)
+                    if s.wake_at is not None:
+                        wake_times.append(s.wake_at)
                 except BaseException as exc:  # noqa: BLE001 - re-raised below
                     errors.append(exc)
         if errors:
             self._store.fail_step(self.run_id, key, _format_exc(errors[0]), attempts=1)
             raise errors[0]
-        if waiting:
-            raise Suspended(waiting)
+        if suspended:
+            raise Suspended(waiting, wake_at=min(wake_times) if wake_times else None)
         self._store.complete_step(self.run_id, key, results)
         with self._stats.lock:
             self._stats.executed += 1
@@ -351,10 +442,17 @@ class Context:
 
 
 class Engine:
-    """Entry point: starts runs and brings them back."""
+    """Entry point: starts runs, brings them back, and works through queues of them.
 
-    def __init__(self, db: str | Path | None = None, *, store: Store | None = None):
+    Only one process drives a run at a time. A driver holds a lease that it renews
+    every ``lease_ttl / 3`` seconds; if it dies, the lease lapses and any other
+    process (or ``rewindable worker``) can take over.
+    """
+
+    def __init__(self, db: str | Path | None = None, *, store: Store | None = None, lease_ttl: float = 30.0):
         self.store = store or Store(db)
+        self.lease_ttl = lease_ttl
+        self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -372,16 +470,45 @@ class Engine:
         )
         return self._drive(run, workflow)
 
-    def resume(self, run_id: str, workflow: Workflow | None = None, *, budget: Budget | None = None) -> RunResult:
+    def submit(
+        self,
+        workflow: Workflow | str,
+        input: Any = None,
+        *,
+        run_id: str | None = None,
+        budget: Budget | None = None,
+    ) -> str:
+        """Queue a run for ``rewindable worker`` (or :meth:`work`) to pick up. Returns its id.
+
+        ``workflow`` may be a function or a reference such as ``"pkg.module:flow"``.
+        """
+        ref = workflow if isinstance(workflow, str) else workflow_ref(workflow)
+        run = self.store.create_run(
+            ref, input, run_id=run_id, budget=asdict(budget) if budget else None, status="queued"
+        )
+        return run.id
+
+    def resume(
+        self,
+        run_id: str,
+        workflow: Workflow | None = None,
+        *,
+        budget: Budget | None = None,
+        force: bool = False,
+    ) -> RunResult:
         """Continue a run that crashed, failed or was waiting. Completed steps are
-        replayed from the journal; everything after them runs for real."""
+        replayed from the journal; everything after them runs for real.
+
+        Raises :class:`RunLocked` if another live process is driving the run, unless
+        ``force`` is set.
+        """
         run = self.store.get_run(run_id)
         if run.status == "completed":
             return self._result(run, _Stats())
         if budget is not None:
             self.store.set_budget(run.id, asdict(budget))
             run = self.store.get_run(run.id)
-        return self._drive(run, workflow or load_workflow(run.workflow))
+        return self._drive(run, workflow or load_workflow(run.workflow), force=force)
 
     def rewind(
         self,
@@ -407,20 +534,85 @@ class Engine:
     def approve(self, run_id: str, key: str, *, approved: bool = True, note: str = "") -> None:
         self.signal(run_id, key, {"approved": approved, "note": note})
 
-    def _drive(self, run: Run, workflow: Workflow) -> RunResult:
+    # -- workers -----------------------------------------------------------
+
+    def ready(self) -> list[Run]:
+        """Runs that should be driven now (see :meth:`Store.ready_runs`), plus runs
+        left ``running`` by a process on this machine that no longer exists."""
+        ready = {r.id: r for r in self.store.ready_runs(stale_after=self.lease_ttl)}
+        for run in self.store.list_runs(status="running", limit=200):
+            if run.id not in ready and run.lease_owner and _owner_is_dead(run.lease_owner):
+                ready[run.id] = run
+        return sorted(ready.values(), key=lambda r: r.created_at)
+
+    def work(
+        self,
+        *,
+        once: bool = False,
+        poll: float = 1.0,
+        stop: threading.Event | None = None,
+        on_result: Callable[[RunResult], None] | None = None,
+    ) -> int:
+        """Drive every ready run, then keep polling for more (unless ``once``).
+
+        Returns how many runs were driven. Safe to run several workers against one
+        journal: leases make sure each run has one driver at a time.
+        """
+        stop = stop or threading.Event()
+        driven = 0
+        while not stop.is_set():
+            for run in self.ready():
+                if stop.is_set():
+                    break
+                try:
+                    workflow = load_workflow(run.workflow)
+                except WorkflowNotFound as exc:
+                    self.store.set_status(run.id, "failed", error=str(exc))
+                    continue
+                try:
+                    result = self._drive(self.store.get_run(run.id), workflow, force=_owner_is_dead(run.lease_owner))
+                except RunLocked:
+                    continue
+                driven += 1
+                if on_result:
+                    on_result(result)
+            if once:
+                break
+            stop.wait(poll)
+        return driven
+
+    # -- driving -----------------------------------------------------------
+
+    def _drive(self, run: Run, workflow: Workflow, *, force: bool = False) -> RunResult:
+        holder = run.lease_owner if (force or _owner_is_dead(run.lease_owner)) else None
+        if not self.store.acquire_lease(run.id, self.owner, self.lease_ttl, steal_from=holder):
+            current = self.store.get_run(run.id)
+            raise RunLocked(f"run {run.id} is being driven by {current.lease_owner}")
+        stop = threading.Event()
+        heartbeat = threading.Thread(target=self._heartbeat, args=(run.id, stop), daemon=True)
+        heartbeat.start()
         stats = _Stats()
-        ctx = Context(self.store, run, stats=stats)
-        self.store.set_status(run.id, "running")
         try:
-            value = workflow(ctx, run.input) if _takes_input(workflow) else workflow(ctx)
-            output = json.loads(dumps(value))
-        except Suspended:
-            self.store.set_status(run.id, "waiting")
-        except Exception as exc:  # noqa: BLE001 - recorded in the journal
-            self.store.set_status(run.id, "failed", error=_format_exc(exc))
-        else:
-            self.store.set_status(run.id, "completed", output=output)
+            ctx = Context(self.store, run, stats=stats)
+            self.store.set_status(run.id, "running")
+            try:
+                value = workflow(ctx, run.input) if _takes_input(workflow) else workflow(ctx)
+                output = json.loads(dumps(value))
+            except Suspended as suspended:
+                self.store.set_status(run.id, "waiting", wake_at=suspended.wake_at)
+            except Exception as exc:  # noqa: BLE001 - recorded in the journal
+                self.store.set_status(run.id, "failed", error=_format_exc(exc))
+            else:
+                self.store.set_status(run.id, "completed", output=output)
+        finally:
+            stop.set()
+            heartbeat.join()
+            self.store.release_lease(run.id, self.owner)
         return self._result(self.store.get_run(run.id), stats)
+
+    def _heartbeat(self, run_id: str, stop: threading.Event) -> None:
+        while not stop.wait(self.lease_ttl / 3):
+            self.store.renew_lease(run_id, self.owner, self.lease_ttl)
 
     def _result(self, run: Run, stats: _Stats) -> RunResult:
         return RunResult(
@@ -429,11 +621,32 @@ class Engine:
             output=run.output,
             error=run.error,
             waiting_for=[s.key for s in self.store.signals(run.id, pending_only=True)],
+            wake_at=run.wake_at if run.status == "waiting" else None,
             executed_steps=stats.executed,
             replayed_steps=stats.replayed,
             saved_usd=stats.saved_usd,
             cost_usd=self.store.usage(run.id)["cost_usd"],
         )
+
+
+def _owner_is_dead(owner: str | None) -> bool:
+    """True if ``owner`` is a process on this machine that no longer exists."""
+    if not owner or os.name != "posix":
+        return False
+    host, _, rest = owner.partition(":")
+    pid_text = rest.split(":", 1)[0]
+    if host != socket.gethostname() or not pid_text.isdigit():
+        return False
+    pid = int(pid_text)
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 # -- workflow references ------------------------------------------------------

@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rewindable</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e4df;
+    --accent: #3a5bd9; --ok: #1f8a4c; --warn: #b26b00; --bad: #c4312b; --run: #0e7c9b;
+    --code: #f1f1ee; --hover: #f0f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1c1c1a; --ink: #ecebe6; --muted: #9a9993; --line: #2e2e2b;
+      --accent: #8aa2ff; --ok: #4fc27f; --warn: #e5a23a; --bad: #ff6b62; --run: #4cc3e3;
+      --code: #252522; --hover: #242422;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+           background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; white-space: nowrap; }
+  header .db { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  header .spacer { flex: 1; }
+  .badge { background: var(--warn); color: #fff; border-radius: 999px; padding: 2px 9px; font-size: 12px;
+           font-weight: 600; cursor: pointer; border: 0; }
+  main { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; min-height: calc(100vh - 50px); }
+  aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; max-height: calc(100vh - 50px);
+          position: sticky; top: 50px; }
+  .filters { display: flex; gap: 4px; padding: 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .filters button { border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 6px;
+                    padding: 3px 9px; cursor: pointer; font-size: 12px; }
+  .filters button.on { color: var(--ink); border-color: var(--ink); }
+  .run { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .run:hover { background: var(--hover); }
+  .run.sel { background: var(--hover); box-shadow: inset 3px 0 0 var(--accent); }
+  .run .top { display: flex; justify-content: space-between; gap: 8px; }
+  .run .wf { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pill { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
+  .s-completed { color: var(--ok); } .s-failed { color: var(--bad); } .s-waiting { color: var(--warn); }
+  .s-running { color: var(--run); } .s-queued { color: var(--muted); }
+  section.detail { padding: 22px 28px 60px; min-width: 0; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+  .title { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .title h2 { margin: 0; font-size: 20px; }
+  .meta { color: var(--muted); font-size: 12.5px; margin: 6px 0 14px; overflow-wrap: anywhere; }
+  .meta a { color: var(--accent); cursor: pointer; }
+  .stats { display: flex; gap: 22px; margin: 12px 0 18px; flex-wrap: wrap; }
+  .stat b { display: block; font-size: 18px; } .stat span { color: var(--muted); font-size: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  .card.ask { border-color: var(--warn); }
+  .card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .ask .q { font-weight: 600; margin-bottom: 10px; white-space: pre-wrap; word-break: break-word; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 160px; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line);
+                     background: var(--bg); color: var(--ink); }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px;
+         padding: 6px 12px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  .btn:hover { border-color: var(--ink); }
+  .btn.ok { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .btn.bad { color: var(--bad); }
+  .btn.small { padding: 2px 8px; font-size: 12px; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+  tr.step { cursor: pointer; } tr.step:hover td { background: var(--hover); }
+  td.key { white-space: nowrap; color: var(--muted); }
+  td.name { white-space: nowrap; }
+  td.num { text-align: right; white-space: nowrap; color: var(--muted); }
+  td.sum { color: var(--muted); max-width: 0; width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mark { display: inline-block; width: 14px; }
+  .k-llm { color: var(--accent); } .k-parallel { color: var(--run); } .k-signal, .k-timer { color: var(--warn); }
+  tr.body td { background: var(--bg); padding: 12px 14px; }
+  pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow: auto; max-height: 420px;
+        white-space: pre-wrap; word-break: break-word; margin: 6px 0; }
+  .block { margin: 6px 0; }
+  .block .label { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .err { color: var(--bad); }
+  .toolbar { display: flex; gap: 8px; margin-top: 8px; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; }
+    aside { position: static; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+    section.detail { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>⏪ rewindable</h1>
+  <span class="db mono" title="journal">{{DB}}</span>
+  <span class="spacer"></span>
+  <button class="badge" id="pending" hidden></button>
+</header>
+<main>
+  <aside>
+    <div class="filters" id="filters"></div>
+    <div id="runs"></div>
+  </aside>
+  <section class="detail" id="detail"><div class="empty">Pick a run on the left.</div></section>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const state = { runs: [], filter: "", selected: decodeURIComponent(location.hash.slice(1)) || null, open: new Set(), notes: {} };
+
+async function getJSON(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+  return res.json();
+}
+async function post(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Rewindable": "1" },
+                                   body: JSON.stringify(body || {}) });
+  const data = await res.json();
+  if (!res.ok) { alert(data.error || res.statusText); throw new Error(data.error); }
+  return data;
+}
+
+const money = (v) => !v ? "" : v < 1 ? "$" + v.toFixed(4) : "$" + v.toFixed(2);
+const short = (wf) => (wf || "").split("/").pop();
+function ago(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function until(ts) {
+  const s = Math.max(0, ts - Date.now() / 1000);
+  return s < 90 ? Math.round(s) + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h";
+}
+const preview = (v, n = 90) => {
+  const t = (typeof v === "string" ? v : JSON.stringify(v) ?? "").replace(/\s+/g, " ");
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+};
+const textOf = (blocks) => (blocks || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+
+function summary(step) {
+  if (step.status === "failed") return (step.error || "failed").trim().split("\n").pop();
+  if (step.status === "running") return step.kind === "timer" && step.output ? "sleeping, wakes in " + until(step.output.wake_at) : "in progress";
+  const out = step.output;
+  if (step.kind === "llm" && out) {
+    const uses = (out.content || []).filter((b) => b.type === "tool_use").map((b) => b.name);
+    return uses.length ? "→ " + uses.join(", ") : preview(textOf(out.content));
+  }
+  if (step.kind === "parallel" && Array.isArray(out)) return out.length + " branches";
+  if (step.kind === "signal" && out && typeof out === "object" && "approved" in out)
+    return (out.approved ? "approved" : "rejected") + (out.note ? " (" + out.note + ")" : "");
+  if (step.kind === "timer") return "slept";
+  if (step.name.startsWith("tool:") && out && "ok" in out) return out.ok ? preview(out.value) : "error: " + out.error;
+  return preview(out);
+}
+
+function renderBlocks(blocks) {
+  return (blocks || []).map((b) => {
+    if (b.type === "text") return `<div class="block"><div class="label">text</div><pre>${esc(b.text)}</pre></div>`;
+    if (b.type === "tool_use") return `<div class="block"><div class="label">tool call · ${esc(b.name)}</div><pre>${esc(JSON.stringify(b.input, null, 2))}</pre></div>`;
+    if (b.type === "thinking") return b.thinking ? `<div class="block"><div class="label">thinking</div><pre>${esc(b.thinking)}</pre></div>` : "";
+    return `<div class="block"><div class="label">${esc(b.type)}</div><pre>${esc(JSON.stringify(b, null, 2))}</pre></div>`;
+  }).join("");
+}
+
+function stepBody(step) {
+  let html = "";
+  if (step.error) html += `<div class="block"><div class="label err">error (attempt ${step.attempts})</div><pre class="err">${esc(step.error)}</pre></div>`;
+  if (step.kind === "llm" && step.output) {
+    const u = step.output.usage || {};
+    html += `<div class="block label">${esc(step.output.model || "")} · stop: ${esc(step.output.stop_reason)} · ${u.input_tokens || 0} in / ${u.output_tokens || 0} out · ${money(step.cost_usd) || "$0"}</div>`;
+    html += renderBlocks(step.output.content);
+  } else if (step.output !== null && step.output !== undefined) {
+    html += `<pre>${esc(JSON.stringify(step.output, null, 2))}</pre>`;
+  }
+  html += `<div class="toolbar"><button class="btn small" data-rewind="${esc(step.key)}">⏪ Rewind here</button>
+           <span class="meta">re-executes from step ${esc(step.key)} in a new run, with your current code</span></div>`;
+  return html;
+}
+
+function renderList() {
+  const counts = state.runs.reduce((a, r) => (a[r.status] = (a[r.status] || 0) + 1, a), {});
+  $("#filters").innerHTML = ["", "waiting", "running", "failed", "completed", "queued"]
+    .filter((f) => !f || counts[f])
+    .map((f) => `<button data-filter="${f}" class="${state.filter === f ? "on" : ""}">${f || "all"} ${f ? counts[f] : state.runs.length}</button>`)
+    .join("");
+  const runs = state.runs.filter((r) => !state.filter || r.status === state.filter);
+  $("#runs").innerHTML = runs.map((r) => `
+    <div class="run ${r.id === state.selected ? "sel" : ""}" data-run="${esc(r.id)}">
+      <div class="top"><span class="mono">${esc(r.id)}</span><span class="pill s-${esc(r.status)}">${esc(r.status)}</span></div>
+      <div class="wf">${esc(short(r.workflow))}${r.parent_run_id ? " · ⑂ " + esc(r.parent_run_id) + "@" + esc(r.forked_at) : ""}</div>
+      <div class="wf">${ago(r.created_at)} · ${r.llm_calls} model calls ${r.cost_usd ? "· " + money(r.cost_usd) : ""}${r.pending.length ? " · ⏸ needs you" : ""}</div>
+    </div>`).join("") || `<div class="empty">No runs${state.filter ? " with this status" : " yet"}.</div>`;
+  const pending = state.runs.reduce((n, r) => n + r.pending.length, 0);
+  const badge = $("#pending");
+  badge.hidden = !pending;
+  badge.textContent = pending + " waiting on you";
+}
+
+function renderDetail(run) {
+  const canResume = ["failed", "running", "waiting", "queued"].includes(run.status);
+  const signals = run.signals.map((s) => `
+    <div class="card ask">
+      <h3>Waiting for you · ${esc(s.key)} · ${ago(s.requested_at)}</h3>
+      <div class="q">${esc(s.prompt || "A signal named " + s.key)}</div>
+      <div class="row">
+        <input type="text" placeholder="Note for the agent (optional)" data-note="${esc(s.key)}" value="${esc(state.notes[run.id + s.key] || "")}">
+        <button class="btn ok" data-answer="${esc(s.key)}" data-approved="1">Approve</button>
+        <button class="btn bad" data-answer="${esc(s.key)}" data-approved="0">Reject</button>
+      </div>
+    </div>`).join("");
+  const rows = run.steps.map((s) => {
+    const mark = { completed: "✓", failed: "✗", running: "…" }[s.status] || "?";
+    const open = state.open.has(run.id + s.key);
+    return `<tr class="step" data-step="${esc(s.key)}">
+        <td class="key mono" style="padding-left:${8 + s.depth * 18}px"><span class="mark s-${s.status === "running" ? "running" : s.status}">${mark}</span> ${esc(s.key)}</td>
+        <td class="name k-${esc(s.kind)}">${esc(s.name)}</td>
+        <td class="num">${s.duration != null ? s.duration.toFixed(1) + "s" : ""}</td>
+        <td class="num">${money(s.cost_usd)}</td>
+        <td class="sum ${s.status === "failed" ? "err" : ""}">${esc(summary(s))}</td>
+      </tr>${open ? `<tr class="body"><td colspan="5">${stepBody(s)}</td></tr>` : ""}`;
+  }).join("");
+  const result = run.status === "completed"
+    ? `<div class="card"><h3>Output</h3><pre>${esc(typeof run.output === "string" ? run.output : JSON.stringify(run.output, null, 2))}</pre></div>`
+    : run.status === "failed" && run.error ? `<div class="card"><h3 class="err">Error</h3><pre class="err">${esc(run.error)}</pre></div>` : "";
+  const lineage = [
+    run.parent_run_id ? `rewound from <a data-go="${esc(run.parent_run_id)}">${esc(run.parent_run_id)}</a> at step ${esc(run.forked_at)}` : "",
+    run.children.length ? "rewinds: " + run.children.map((c) => `<a data-go="${esc(c)}">${esc(c)}</a>`).join(", ") : "",
+    run.wake_at && run.status === "waiting" ? "timer wakes in " + until(run.wake_at) : "",
+  ].filter(Boolean).join(" · ");
+  $("#detail").innerHTML = `
+    <div class="title"><h2 class="mono">${esc(run.id)}</h2><span class="pill s-${esc(run.status)}">${esc(run.status)}</span>
+      ${canResume ? `<button class="btn small" data-resume="1">▶ Resume</button>` : ""}</div>
+    <div class="meta mono">${esc(run.workflow)}</div>
+    ${lineage ? `<div class="meta">${lineage}</div>` : ""}
+    <div class="stats">
+      <div class="stat"><b>${run.steps.length}</b><span>steps</span></div>
+      <div class="stat"><b>${run.llm_calls}</b><span>model calls</span></div>
+      <div class="stat"><b>${run.tokens.toLocaleString()}</b><span>tokens</span></div>
+      <div class="stat"><b>${money(run.cost_usd) || "$0"}</b><span>cost${run.budget && run.budget.max_cost_usd ? " of $" + run.budget.max_cost_usd + " budget" : ""}</span></div>
+    </div>
+    ${signals}
+    <div class="card"><h3>Input</h3><pre>${esc(typeof run.input === "string" ? run.input : JSON.stringify(run.input, null, 2))}</pre></div>
+    <div class="card"><h3>Steps · click one to inspect it</h3><table>${rows || `<tr><td class="meta">No steps yet.</td></tr>`}</table></div>
+    ${result}`;
+}
+
+async function refresh() {
+  try {
+    state.runs = await getJSON("/api/runs");
+    renderList();
+    const typing = document.activeElement && document.activeElement.matches("#detail input");
+    if (state.selected && !typing) renderDetail(await getJSON("/api/runs/" + encodeURIComponent(state.selected)));
+  } catch (e) {
+    if (state.selected) $("#detail").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function select(id) {
+  state.selected = id;
+  history.replaceState(null, "", "#" + encodeURIComponent(id));
+  refresh();
+}
+
+document.addEventListener("click", async (ev) => {
+  const t = ev.target.closest("[data-run],[data-filter],[data-step],[data-answer],[data-resume],[data-rewind],[data-go],#pending");
+  if (!t) return;
+  if (t.id === "pending") { state.filter = "waiting"; return refresh(); }
+  if (t.dataset.run) return select(t.dataset.run);
+  if (t.dataset.go) return select(t.dataset.go);
+  if (t.dataset.filter !== undefined) { state.filter = t.dataset.filter; return renderList(); }
+  if (t.dataset.step) {
+    const k = state.selected + t.dataset.step;
+    state.open.has(k) ? state.open.delete(k) : state.open.add(k);
+    return refresh();
+  }
+  const run = state.selected;
+  if (t.dataset.answer) {
+    const note = state.notes[run + t.dataset.answer] || "";
+    await post(`/api/runs/${encodeURIComponent(run)}/signals/${encodeURIComponent(t.dataset.answer)}`,
+               { approved: t.dataset.approved === "1", note });
+    delete state.notes[run + t.dataset.answer];
+    document.activeElement.blur();
+    return setTimeout(refresh, 300);
+  }
+  if (t.dataset.resume) { await post(`/api/runs/${encodeURIComponent(run)}/resume`); return setTimeout(refresh, 300); }
+  if (t.dataset.rewind) {
+    if (!confirm(`Branch a new run from ${run} that re-executes from step ${t.dataset.rewind}?`)) return;
+    const res = await post(`/api/runs/${encodeURIComponent(run)}/rewind`, { to: t.dataset.rewind });
+    return setTimeout(() => select(res.run_id), 300);
+  }
+});
+document.addEventListener("input", (ev) => {
+  if (ev.target.dataset.note !== undefined) state.notes[state.selected + ev.target.dataset.note] = ev.target.value;
+});
+
+window.addEventListener("hashchange", () => {
+  const id = decodeURIComponent(location.hash.slice(1));
+  if (id && id !== state.selected) { state.selected = id; refresh(); }
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -34,4 +34,20 @@ run="$(latest)"
 REWINDABLE_DEMO_FIXED=1 rewindable rewind "$run" --to 2 | tee out.txt
 grep -q "270.0 USD" out.txt
 
+echo "--- 05 durable timers and the worker"
+export REWINDABLE_DEMO_FAST=1
+python "$root/examples/05_follow_up_later.py"
+run="$(latest)"
+sleep 5                       # the 3 "days" pass
+rewindable worker --once      # wakes it; it now waits for an approval with a 1-"day" timeout
+sleep 2
+rewindable worker --once      # nobody answered in time
+rewindable show "$run" | tee out.txt
+grep -q "no follow-up sent" out.txt
+
+echo "--- queue a run, let a worker drive it"
+queued="$(rewindable start "$root/examples/04_rewind_and_fix.py:answer" --input '"How much is 250 EUR in USD?"' --queue)"
+rewindable worker --once
+rewindable show "$queued" | grep -q "completed"
+
 echo "all examples OK"

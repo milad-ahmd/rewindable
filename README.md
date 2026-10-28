@@ -14,8 +14,12 @@ Agents fail in boring ways. The process dies at step 37 of 40, and you pay for s
 - **Pause for a human.** `ctx.approve("Refund €129?")` saves the run and lets the process exit. Approve from the CLI tomorrow and it continues from that exact line.
 - **Rewind to any step.** Fix the bug, then `rewindable rewind <run> --to 7`. Steps 1–6 replay from the journal and step 7 onward runs with your new code.
 - **Fan out safely.** `ctx.parallel(...)` and parallel tool calls each journal on their own. One failing branch never re-runs the others.
+- **Sleep for days.** `ctx.sleep(3 * DAY)` saves the run with a wake-up time. `rewindable worker` resumes it on time, even after a reboot.
 - **Hard budgets.** `Budget(max_cost_usd=2)` is checked before every model call and counts usage across crashes and resumes.
-- **See everything.** `rewindable show <run>` prints the full step tree with timings, tokens and cost.
+- **One driver per run.** Leases stop two processes from running the same workflow at once, and runs left behind by crashed processes are picked up automatically.
+- **See everything.** `rewindable ui` opens a local web view of every run, step and model conversation, with approve, resume and rewind buttons. `rewindable show <run>` gives the same view in the terminal.
+
+![The rewindable web UI: a run waiting for a human to approve a refund](docs/ui.jpg)
 
 ```text
 $ rewindable show run_34abbb562f61        # examples/03_research_team.py, offline mode
@@ -45,7 +49,12 @@ pip install -e .
 python examples/01_crash_and_resume.py --crash    # 💥 dies before writing the report
 rewindable runs                                    # the run is stuck in "running"
 rewindable resume <run_id>                         # replayed 9 steps from the journal, executed 1
+
+python examples/02_human_approval.py               # ⏸ pauses before issuing a refund
+rewindable ui                                      # approve it in the browser and watch it finish
 ```
+
+The other examples cover a [research team of sub-agents](examples/03_research_team.py), [rewinding to test a bug fix](examples/04_rewind_and_fix.py), and a [workflow that sleeps for days](examples/05_follow_up_later.py).
 
 To use Claude instead, run `pip install -e ".[anthropic]"`, set `ANTHROPIC_API_KEY`, and add `REWINDABLE_LIVE=1` before any example command.
 
@@ -99,11 +108,13 @@ print(result.status, result.output)  # "waiting" until someone runs `rewindable 
 | `ctx.step(name, fn, *args, retries=0)` | Runs `fn` once for this point in the workflow; afterwards it is served from the journal. |
 | `ctx.llm(model, messages=…, tools=…)` | A model call as a step, with budget check and token and cost accounting. |
 | `ctx.parallel([branch, …])` | Runs `branch(child_ctx)` concurrently; each branch journals its own steps. |
-| `ctx.approve(question)` / `ctx.wait_for(signal)` | Suspends the run until a human or another system answers. |
+| `ctx.approve(question, timeout=…)` / `ctx.wait_for(signal, timeout=…, default=…)` | Suspends the run until a human or another system answers, optionally with a deadline. |
+| `ctx.sleep(seconds)` | A durable timer: short waits sleep in-process, long ones suspend the run until a worker wakes it. |
 | `ctx.now()` / `ctx.uuid()` | Time and randomness, recorded so replays see the same values. |
+| `current_step().idempotency_key` | Inside a step: a key that stays the same across retries and resumes, for payment and email APIs. |
 | `Agent(name, model, tools=…, instructions=…)` | A tool-use loop where every model turn and tool call is a step. |
 | `agent.as_tool()` | Lets one agent delegate to another (supervisor and specialist teams). |
-| `Engine.run / resume / rewind / signal / approve` | Run lifecycle, also available from the CLI. |
+| `Engine.run / submit / resume / rewind / signal / approve / work` | Run lifecycle and a worker loop, also available from the CLI. |
 
 ## The one rule: same inputs, same steps
 
@@ -124,16 +135,24 @@ If you change the workflow so that step 4 is now a different step, `resume` rais
 ## CLI
 
 ```text
+rewindable ui                               local web UI: runs, steps, conversations, approve/resume/rewind
 rewindable runs [--status waiting]          list recent runs, with cost
-rewindable show RUN                         step tree: timing, tokens, cost, results
+rewindable show RUN [--json]                step tree: timing, tokens, cost, results
+rewindable step RUN KEY                     everything recorded for one step (full model output)
 rewindable pending                          approvals and signals waiting on a human
 rewindable approve RUN KEY [--reject --note "…"]
 rewindable signal RUN KEY '{"json": "payload"}'
 rewindable resume RUN [--max-cost 5]        continue a crashed, failed or waiting run
 rewindable rewind RUN --to STEP [--input '…']
+rewindable start app.py:flow --input '…' [--queue]
+rewindable worker [--once]                  drive queued runs, due timers, answered approvals, crashed runs
 ```
 
-Run ids accept unique prefixes. The journal lives in `.rewindable/runs.db`; override it with `--db` or `REWINDABLE_DB`. Because the journal is one SQLite file in WAL mode, a run can pause on a laptop and be approved from a cron job on the same machine.
+Run ids accept unique prefixes. The journal lives in `.rewindable/runs.db`; override it with `--db` or `REWINDABLE_DB`. Because the journal is one SQLite file in WAL mode, any process on the machine can approve, resume or work on a run.
+
+### Running in production
+
+Queue work with `engine.submit(flow, input)` (or `rewindable start … --queue`) and keep one or more `rewindable worker` processes running, for example under systemd or in a container. A worker drives queued runs, wakes timers that are due, resumes runs whose approval has arrived, and takes over runs whose driver crashed (on the same machine immediately, elsewhere once the 30-second lease lapses). Several workers can share one journal safely.
 
 ## Models
 
@@ -152,11 +171,12 @@ Any object with `name`, `complete(request) -> response` and `cost(response) -> f
 
 ## Status and roadmap
 
-`0.1` is an alpha. The core semantics are tested (crash in a subprocess, resume, suspend, parallel, budget, rewind), but the API may still change. Ideas where help is very welcome:
+This is an alpha. The core semantics are tested (a real crash in a subprocess, resume, suspend, parallel, budget, rewind, leases, timers, the worker and the web UI), but the API may still change. Ideas where help is very welcome:
 
+- [x] A local web UI for the run timeline (`rewindable ui`)
+- [x] Durable timers, approval timeouts and a background worker
 - [ ] `async` workflows and `asyncio`-native parallel branches
 - [ ] Postgres journal backend for multi-machine workers
-- [ ] A local web UI for the run timeline (`rewindable ui`)
 - [ ] OpenTelemetry export of steps as spans
 - [ ] MCP servers as tool sources
 - [ ] Step memoization across runs (cache identical tool calls)
@@ -165,7 +185,7 @@ Any object with `name`, `complete(request) -> response` and `cost(response) -> f
 
 ## Contributing
 
-Issues, ideas and PRs are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The test suite runs in under a second and needs no API keys.
+Issues, ideas and PRs are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The test suite runs in a few seconds and needs no API keys.
 
 ## License
 

@@ -39,13 +39,23 @@ class WorkflowNotFound(RewindableError):
     """The workflow recorded for a run could not be imported."""
 
 
+class RunLocked(RewindableError):
+    """Another live process is driving this run right now.
+
+    Each driver holds a lease that it renews while it works. Leases of crashed
+    processes expire on their own (immediately, for a dead process on the same
+    machine); pass ``force=True`` to take over anyway.
+    """
+
+
 class Suspended(BaseException):
-    """Internal control-flow signal: the run is waiting on one or more signals.
+    """Internal control-flow signal: the run is waiting on signals and/or a timer.
 
     It derives from ``BaseException`` so that a broad ``except Exception`` in user
     code does not swallow it.
     """
 
-    def __init__(self, keys: list[str]):
-        super().__init__(", ".join(keys))
+    def __init__(self, keys: list[str], wake_at: float | None = None):
+        super().__init__(", ".join(keys) or f"timer until {wake_at}")
         self.keys = keys
+        self.wake_at = wake_at

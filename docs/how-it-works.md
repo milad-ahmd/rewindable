@@ -8,9 +8,9 @@ Everything lives in one SQLite database (`.rewindable/runs.db` by default) in WA
 
 | Table | One row per | Holds |
 |---|---|---|
-| `runs` | workflow run | workflow reference, input, status (`running` / `waiting` / `completed` / `failed`), output or error, budget, and the run it was rewound from |
+| `runs` | workflow run | workflow reference, input, status (`queued` / `running` / `waiting` / `completed` / `failed`), output or error, budget, the run it was rewound from, timer wake-up time, and the current driver's lease |
 | `steps` | step of a run | key, name, kind (`step` / `llm` / `parallel` / `signal`), status, JSON output or error, attempts, tokens, cost, timings |
-| `signals` | signal a run waited for | the prompt shown to the human, the delivered payload, timestamps |
+| `signals` | signal a run waited for | the prompt shown to the human, the delivered payload, and when it was requested, delivered and consumed |
 
 A run's workflow is stored as an importable reference: `package.module:function`, or `/abs/path/script.py:function` for scripts. That is how `rewindable resume` in a fresh process finds your code again. The script's folder goes on `sys.path` the way `python script.py` does it, and the script is imported under a module name other than `__main__`, so its `if __name__ == "__main__":` block does not run again.
 
@@ -36,7 +36,20 @@ On replay each completed step is checked by **name and kind**. If the journal sa
 
 **`rewind --to K`.** A new run is created with the same workflow and input (or a new `--input`). Every completed step that **started before K** is copied into it, except steps that *enclose* K (the parallel group around K is re-run, so that K runs again). The new run then executes normally. The original run is never modified, and `rewindable runs` shows the new one as `⑂ parent@K`.
 
+**`ctx.sleep(seconds)`.** The wake-up time is written into the timer step the first time it is reached, so it does not move when the run is replayed. If the time is more than a second away, the run is saved as `waiting` with `wake_at` set and control returns. `rewindable worker` resumes it once `wake_at` has passed. Approval and signal timeouts work the same way: the deadline counts from when the run first asked, and on expiry the step is completed with the default (for `approve`, a rejection).
+
 **Budgets.** Before each model call, the run's completed usage is summed from the journal and checked against the budget. Replayed steps count as well, so a crash-loop cannot spend past the limit. `resume --max-cost` raises the limit for one run.
+
+## The worker
+
+`Engine.work()` (`rewindable worker`) loops over `Store.ready_runs()`. It picks up:
+
+- `queued` runs, created by `engine.submit()` or `rewindable start --queue`
+- `waiting` runs whose `wake_at` has passed
+- `waiting` runs with a signal that was requested, has been delivered, and has not yet been consumed by its `wait_for` step. Tracking consumption (not timestamps) means an answer that arrives while other parallel branches are still running is never missed.
+- `running` runs whose lease expired, or whose lease holder was a now-dead process on this machine
+
+Each one is driven under a lease, so any number of workers can share a journal.
 
 ## Guarantees and limits
 
@@ -44,4 +57,4 @@ On replay each completed step is checked by **name and kind**. If the journal sa
 - **Step outputs must be JSON-serializable.** Dataclasses and pydantic models are converted automatically.
 - **Steps cannot be nested.** The body of a step is opaque: when it is replayed its function does not run, so steps opened inside it would vanish and shift every later key. Open steps from the workflow body or a `ctx.parallel` branch. `NestedStepError` enforces this.
 - **Agent tool errors are data.** A tool that raises is recorded as a completed step whose output is the error, because that error is exactly what the model saw. On replay the model's later turns stay consistent with it.
-- **One process drives a run at a time.** Nothing stops two processes from resuming the same run at once. A lease or lock is on the roadmap together with the Postgres backend.
+- **One process drives a run at a time.** Before driving a run, a process takes a lease on it (`lease_owner`, `lease_expires`) with a conditional `UPDATE`, and a heartbeat thread renews it every `lease_ttl / 3` seconds (30 s TTL by default). A second driver gets `RunLocked`. If the holder was a process on the same machine that no longer exists, the lease is taken over immediately. Otherwise it is taken over once it expires. `Engine.resume(..., force=True)` takes over anyway; the CLI deliberately does not offer that, because waiting 30 seconds is safer than two drivers.

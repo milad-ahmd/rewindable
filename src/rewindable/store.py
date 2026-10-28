@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS runs (
     parent_run_id TEXT,
     forked_at     TEXT,
     created_at    REAL NOT NULL,
-    updated_at    REAL NOT NULL
+    updated_at    REAL NOT NULL,
+    wake_at       REAL,
+    lease_owner   TEXT,
+    lease_expires REAL
 );
 CREATE TABLE IF NOT EXISTS steps (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,10 +57,18 @@ CREATE TABLE IF NOT EXISTS signals (
     payload      TEXT,
     requested_at REAL,
     delivered_at REAL,
+    consumed_at  REAL,
     PRIMARY KEY (run_id, key)
 );
 CREATE INDEX IF NOT EXISTS steps_by_run ON steps (run_id, seq);
+CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status, created_at);
 """
+
+# Columns added after 0.1.0; journals created by older versions get them on open.
+MIGRATIONS = {
+    "runs": {"wake_at": "REAL", "lease_owner": "TEXT", "lease_expires": "REAL"},
+    "signals": {"consumed_at": "REAL"},
+}
 
 
 def default_db_path() -> Path:
@@ -90,7 +101,7 @@ class Run:
     id: str
     workflow: str
     input: Any
-    status: str  # running | waiting | completed | failed
+    status: str  # queued | running | waiting | completed | failed
     output: Any
     error: str | None
     budget: dict | None
@@ -98,6 +109,9 @@ class Run:
     forked_at: str | None
     created_at: float
     updated_at: float
+    wake_at: float | None = None
+    lease_owner: str | None = None
+    lease_expires: float | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +149,7 @@ class Signal:
     payload: Any
     requested_at: float | None
     delivered_at: float | None
+    consumed_at: float | None = None
 
     @property
     def pending(self) -> bool:
@@ -155,6 +170,12 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(SCHEMA)
+            for table, columns in MIGRATIONS.items():
+                existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+                for column, ddl in columns.items():
+                    if column not in existing:
+                        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -164,7 +185,7 @@ class Store:
         with self._lock, self._conn:
             return self._conn.execute(sql, params)
 
-    def _read(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+    def _read(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
@@ -179,13 +200,14 @@ class Store:
         budget: dict | None = None,
         parent_run_id: str | None = None,
         forked_at: str | None = None,
+        status: str = "running",
     ) -> Run:
         run_id = run_id or "run_" + uuid.uuid4().hex[:12]
         now = time.time()
         self._write(
             "INSERT INTO runs (id, workflow, input, status, budget, parent_run_id, forked_at,"
-            " created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)",
-            (run_id, workflow, dumps(input), dumps(budget), parent_run_id, forked_at, now, now),
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, workflow, dumps(input), status, dumps(budget), parent_run_id, forked_at, now, now),
         )
         return self.get_run(run_id)
 
@@ -208,11 +230,62 @@ class Store:
             rows = self._read("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
         return [_run(r) for r in rows]
 
-    def set_status(self, run_id: str, status: str, *, output: Any = None, error: str | None = None) -> None:
+    def set_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        output: Any = None,
+        error: str | None = None,
+        wake_at: float | None = None,
+    ) -> None:
         self._write(
-            "UPDATE runs SET status = ?, output = ?, error = ?, updated_at = ? WHERE id = ?",
-            (status, dumps(output) if status == "completed" else None, error, time.time(), run_id),
+            "UPDATE runs SET status = ?, output = ?, error = ?, wake_at = ?, updated_at = ? WHERE id = ?",
+            (status, dumps(output) if status == "completed" else None, error, wake_at, time.time(), run_id),
         )
+
+    # -- leases: one driver per run ----------------------------------------
+
+    def acquire_lease(self, run_id: str, owner: str, ttl: float, *, steal_from: str | None = None) -> bool:
+        """Claim the right to drive a run. Succeeds if the run is unclaimed, already
+        ours, its lease has expired, or (with ``steal_from``) it is held by that owner."""
+        now = time.time()
+        cursor = self._write(
+            "UPDATE runs SET lease_owner = ?, lease_expires = ? WHERE id = ?"
+            " AND (lease_owner IS NULL OR lease_owner = ? OR lease_expires < ? OR lease_owner = ?)",
+            (owner, now + ttl, run_id, owner, now, steal_from),
+        )
+        return cursor.rowcount == 1
+
+    def renew_lease(self, run_id: str, owner: str, ttl: float) -> bool:
+        cursor = self._write(
+            "UPDATE runs SET lease_expires = ? WHERE id = ? AND lease_owner = ?",
+            (time.time() + ttl, run_id, owner),
+        )
+        return cursor.rowcount == 1
+
+    def release_lease(self, run_id: str, owner: str) -> None:
+        self._write(
+            "UPDATE runs SET lease_owner = NULL, lease_expires = NULL WHERE id = ? AND lease_owner = ?",
+            (run_id, owner),
+        )
+
+    def ready_runs(self, *, stale_after: float, limit: int = 100) -> list[Run]:
+        """Runs a worker should drive now: queued runs, waiting runs whose timer is due
+        or whose signal has arrived, and running runs whose driver stopped renewing."""
+        now = time.time()
+        rows = self._read(
+            "SELECT * FROM runs r WHERE"
+            " (r.lease_owner IS NULL OR r.lease_expires < :now) AND ("
+            "   r.status = 'queued'"
+            "   OR (r.status = 'waiting' AND (r.wake_at <= :now OR EXISTS ("
+            "       SELECT 1 FROM signals s WHERE s.run_id = r.id AND s.requested_at IS NOT NULL"
+            "       AND s.delivered_at IS NOT NULL AND s.consumed_at IS NULL)))"
+            "   OR (r.status = 'running' AND COALESCE(r.lease_expires, r.updated_at + :stale) < :now)"
+            " ) ORDER BY r.created_at LIMIT :limit",
+            {"now": now, "stale": stale_after, "limit": limit},
+        )
+        return [_run(r) for r in rows]
 
     def set_budget(self, run_id: str, budget: dict | None) -> None:
         self._write("UPDATE runs SET budget = ?, updated_at = ? WHERE id = ?", (dumps(budget), time.time(), run_id))
@@ -235,6 +308,10 @@ class Store:
                 "INSERT INTO steps (run_id, key, name, kind, status, started_at) VALUES (?, ?, ?, ?, 'running', ?)",
                 (run_id, key, name, kind, time.time()),
             )
+
+    def set_step_output(self, run_id: str, key: str, output: Any) -> None:
+        """Attach data to an unfinished step (a timer's wake-up time)."""
+        self._write("UPDATE steps SET output = ? WHERE run_id = ? AND key = ?", (dumps(output), run_id, key))
 
     def complete_step(
         self,
@@ -297,6 +374,9 @@ class Store:
             " delivered_at = excluded.delivered_at",
             (run_id, key, dumps(payload), time.time()),
         )
+
+    def consume_signal(self, run_id: str, key: str) -> None:
+        self._write("UPDATE signals SET consumed_at = ? WHERE run_id = ? AND key = ?", (time.time(), run_id, key))
 
     def get_signal(self, run_id: str, key: str) -> Signal | None:
         rows = self._read("SELECT * FROM signals WHERE run_id = ? AND key = ?", (run_id, key))
@@ -373,6 +453,9 @@ def _run(row: sqlite3.Row) -> Run:
         forked_at=row["forked_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        wake_at=row["wake_at"],
+        lease_owner=row["lease_owner"],
+        lease_expires=row["lease_expires"],
     )
 
 
@@ -403,6 +486,7 @@ def _signal(row: sqlite3.Row) -> Signal:
         payload=loads(row["payload"]),
         requested_at=row["requested_at"],
         delivered_at=row["delivered_at"],
+        consumed_at=row["consumed_at"],
     )
 
 
