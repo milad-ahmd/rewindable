@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rewindable"
+version = "0.1.0"
+description = "Crash-proof, resumable, rewindable AI agent workflows. Every model call and tool call is a journaled step: resume after a crash without paying twice, pause for human approval, and rewind to any step."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Milad Ahmadi" }]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["ai", "agents", "llm", "orchestration", "durable-execution", "workflow", "claude", "human-in-the-loop"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=2.3"]
+openai = ["openai>=1.40"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+rewindable = "rewindable.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/milad-ahmd/rewindable"
+Issues = "https://github.com/milad-ahmd/rewindable/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rewindable"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["B008", "SIM105"]
