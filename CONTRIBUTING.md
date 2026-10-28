@@ -34,4 +34,12 @@ Look for issues labelled `good first issue`.
 2. Make sure `pytest` and `ruff` pass.
 3. Describe what changed and why; link the issue.
 
+## Releasing (maintainers)
+
+1. Bump `version` in `pyproject.toml` and `__version__` in `src/rewindable/__init__.py`, and move the changelog entries under the new version.
+2. Merge to `main` and wait for CI to pass.
+3. Publish a GitHub release with the tag `vX.Y.Z` (for example `gh release create v0.3.0 --generate-notes`).
+
+The `Release` workflow tests, builds and uploads to PyPI with trusted publishing; no tokens are stored anywhere. It refuses to publish if the tag and the package version differ.
+
 By contributing you agree that your contributions are licensed under the MIT License.

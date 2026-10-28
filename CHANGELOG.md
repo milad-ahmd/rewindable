@@ -2,6 +2,7 @@
 
 ## 0.2.0
 
+- First release on PyPI: `pip install rewindable`
 - `rewindable ui`: a local web UI to browse runs, inspect every step and model conversation, approve or reject, resume and rewind. No extra dependencies; binds to localhost and rejects cross-site writes.
 - Durable timers: `ctx.sleep(seconds)` suspends long waits and wakes them on time
 - Timeouts for `ctx.approve(..., timeout=)` and `ctx.wait_for(..., timeout=, default=)`

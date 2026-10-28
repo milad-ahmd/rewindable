@@ -3,8 +3,9 @@
 **Crash-proof, resumable, rewindable AI agent workflows. In plain Python, on SQLite, with zero dependencies.**
 
 [![CI](https://github.com/milad-ahmd/rewindable/actions/workflows/ci.yml/badge.svg)](https://github.com/milad-ahmd/rewindable/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/rewindable.svg)](https://pypi.org/project/rewindable/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/milad-ahmd/rewindable/blob/main/LICENSE)
 
 Agents fail in boring ways. The process dies at step 37 of 40, and you pay for steps 1–36 again. A tool has a bug, and you re-run the whole conversation to test the fix. An agent is about to send an email or move money, and you want a human to say yes first, maybe hours later.
 
@@ -19,7 +20,7 @@ Agents fail in boring ways. The process dies at step 37 of 40, and you pay for s
 - **One driver per run.** Leases stop two processes from running the same workflow at once, and runs left behind by crashed processes are picked up automatically.
 - **See everything.** `rewindable ui` opens a local web view of every run, step and model conversation, with approve, resume and rewind buttons. `rewindable show <run>` gives the same view in the terminal.
 
-![The rewindable web UI: a run waiting for a human to approve a refund](docs/ui.jpg)
+![The rewindable web UI: a run waiting for a human to approve a refund](https://raw.githubusercontent.com/milad-ahmd/rewindable/main/docs/ui.jpg)
 
 ```text
 $ rewindable show run_34abbb562f61        # examples/03_research_team.py, offline mode
@@ -38,6 +39,16 @@ input: Should we build an open-source durable agent runtime?
 8 steps · 6 model calls · 9,000 tokens · $0.0648
 ```
 
+## Install
+
+```bash
+pip install rewindable                  # the core: no dependencies
+pip install "rewindable[anthropic]"     # + Claude through the official SDK
+pip install "rewindable[openai]"        # + any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, …)
+```
+
+Python 3.10 or newer.
+
 ## Try it in 60 seconds (no API key needed)
 
 Every example runs offline with a scripted model, so you can try the whole crash → resume → approve → rewind cycle for free.
@@ -54,7 +65,7 @@ python examples/02_human_approval.py               # ⏸ pauses before issuing a
 rewindable ui                                      # approve it in the browser and watch it finish
 ```
 
-The other examples cover a [research team of sub-agents](examples/03_research_team.py), [rewinding to test a bug fix](examples/04_rewind_and_fix.py), and a [workflow that sleeps for days](examples/05_follow_up_later.py).
+The other examples cover a [research team of sub-agents](https://github.com/milad-ahmd/rewindable/blob/main/examples/03_research_team.py), [rewinding to test a bug fix](https://github.com/milad-ahmd/rewindable/blob/main/examples/04_rewind_and_fix.py), and a [workflow that sleeps for days](https://github.com/milad-ahmd/rewindable/blob/main/examples/05_follow_up_later.py).
 
 To use Claude instead, run `pip install -e ".[anthropic]"`, set `ANTHROPIC_API_KEY`, and add `REWINDABLE_LIVE=1` before any example command.
 
@@ -130,7 +141,7 @@ started = ctx.now()
 data = ctx.step("fetch", lambda: requests.get(url).json())
 ```
 
-If you change the workflow so that step 4 is now a different step, `resume` raises `NonDeterminismError` instead of feeding the wrong cached result to the wrong code. Use `rewind --to 4` to branch from the last step that still matches. [How it works](docs/how-it-works.md) covers the journal, step keys, parallel branches and the exact guarantees.
+If you change the workflow so that step 4 is now a different step, `resume` raises `NonDeterminismError` instead of feeding the wrong cached result to the wrong code. Use `rewind --to 4` to branch from the last step that still matches. [How it works](https://github.com/milad-ahmd/rewindable/blob/main/docs/how-it-works.md) covers the journal, step keys, parallel branches and the exact guarantees.
 
 ## CLI
 
@@ -162,7 +173,7 @@ Queue work with `engine.submit(flow, input)` (or `rewindable start … --queue`)
 | `OpenAICompatModel("llama3.2", base_url="http://localhost:11434/v1")` | `pip install "rewindable[openai]"` | Any Chat Completions endpoint: OpenAI, Ollama, vLLM, LM Studio, OpenRouter. |
 | `ScriptedModel(fn_or_list)` | built in | Deterministic offline model for tests, demos and CI. |
 
-Any object with `name`, `complete(request) -> response` and `cost(response) -> float` works as a model. See [models.py](src/rewindable/models.py) for the request and response format (Claude Messages API shape).
+Any object with `name`, `complete(request) -> response` and `cost(response) -> float` works as a model. See [models.py](https://github.com/milad-ahmd/rewindable/blob/main/src/rewindable/models.py) for the request and response format (Claude Messages API shape).
 
 ## How is this different from…
 
@@ -185,8 +196,8 @@ This is an alpha. The core semantics are tested (a real crash in a subprocess, r
 
 ## Contributing
 
-Issues, ideas and PRs are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The test suite runs in a few seconds and needs no API keys.
+Issues, ideas and PRs are welcome; see [CONTRIBUTING.md](https://github.com/milad-ahmd/rewindable/blob/main/CONTRIBUTING.md). The test suite runs in a few seconds and needs no API keys.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/milad-ahmd/rewindable/blob/main/LICENSE)

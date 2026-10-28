@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.24"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -34,6 +34,8 @@ rewindable = "rewindable.cli:main"
 [project.urls]
 Homepage = "https://github.com/milad-ahmd/rewindable"
 Issues = "https://github.com/milad-ahmd/rewindable/issues"
+Changelog = "https://github.com/milad-ahmd/rewindable/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/milad-ahmd/rewindable/blob/main/docs/how-it-works.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rewindable"]
