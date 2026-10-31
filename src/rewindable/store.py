@@ -399,7 +399,9 @@ class Store:
 
         Steps that started before ``at_key`` are kept, except for steps that enclose
         it (a parallel group around the target), which have to run again so that the
-        target itself is re-executed.
+        target itself is re-executed, and steps inside it. A group restarted on resume
+        is re-begun after the branches it finished earlier, so those branches can have
+        a lower ``seq`` than the group and must be dropped by key, not by order.
         """
         source = self.get_run(run_id)
         target = self.get_step(source.id, at_key)
@@ -415,7 +417,10 @@ class Store:
         kept = [
             s
             for s in self.steps(source.id)
-            if s.seq < target.seq and s.status == "completed" and not at_key.startswith(s.key + ".")
+            if s.seq < target.seq
+            and s.status == "completed"
+            and not at_key.startswith(s.key + ".")
+            and not s.key.startswith(at_key + ".")
         ]
         with self._lock, self._conn:
             for s in kept:

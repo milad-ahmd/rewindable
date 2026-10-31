@@ -135,6 +135,47 @@ def test_approval_gate_suspends_then_runs_tool(engine):
     assert model.calls == 2  # the first model call was replayed, not repeated
 
 
+def test_rewind_to_a_resumed_tool_group_reruns_every_tool_in_it(engine):
+    # Resuming re-begins the :tools group, so its seq ends up after the branches that
+    # finished in the first drive; rewinding to the group must still drop them.
+    looked_up, sent = [], []
+
+    @tool
+    def lookup(city: str) -> str:
+        """Weather for a city."""
+        looked_up.append(city)
+        return f"{city}: sunny"
+
+    @tool(requires_approval=True)
+    def send_email(to: str, body: str) -> str:
+        """Send an email."""
+        sent.append(to)
+        return "sent"
+
+    def respond(request):
+        results = tool_results(request)
+        if not results:
+            return calls(call("lookup", city="Berlin"), call("send_email", to="boss@example.com", body="hi"))
+        return " | ".join(r["content"] for r in results)
+
+    agent = Agent("helper", ScriptedModel(respond), tools=[lookup, send_email])
+
+    def flow(ctx):
+        return agent.run(ctx, "weather, then email my boss").text
+
+    first = engine.run(flow)
+    engine.approve(first.run_id, first.waiting_for[0])
+    done = engine.resume(first.run_id, flow)
+    assert done.output == "Berlin: sunny | sent"
+    assert engine.store.get_step(done.run_id, "2").name == "helper:tools"
+
+    branched = engine.rewind(done.run_id, "2", flow)
+    assert looked_up == ["Berlin", "Berlin"]
+    assert branched.status == "waiting"  # the approval inside the group is asked again
+    kept = {s.key for s in engine.store.steps(branched.run_id) if s.status == "completed"}
+    assert kept == {"1", "2.0.1"}
+
+
 def test_rejected_tool_call_is_explained_to_the_model(engine):
     @tool(requires_approval=True)
     def delete_repo(name: str) -> str:

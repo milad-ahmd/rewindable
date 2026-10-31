@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fix: `rewind --to <parallel group>` replayed branches that finished before the group was resumed, so a tool inside the group was never re-run. Rewinding to a step now always re-runs everything inside it. Reported by [@mattabate](https://github.com/mattabate) in [#1](https://github.com/milad-ahmd/rewindable/issues/1).
+
 ## 0.2.0
 
 - First release on PyPI: `pip install rewindable`
