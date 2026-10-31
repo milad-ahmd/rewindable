@@ -6,6 +6,7 @@ Crash at step 7, resume, and steps 1-6 come back from the journal for free.
 
 from .agent import Agent, AgentResult, Tool, tool
 from .errors import (
+    ApprovalCodeError,
     BudgetExceeded,
     NestedStepError,
     NonDeterminismError,
@@ -25,6 +26,7 @@ __all__ = [
     "AgentResult",
     "AnthropicModel",
     "Approval",
+    "ApprovalCodeError",
     "Budget",
     "BudgetExceeded",
     "Context",

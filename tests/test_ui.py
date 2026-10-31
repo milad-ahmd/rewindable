@@ -93,3 +93,17 @@ def test_rewind_from_the_ui(ui):
     assert status == 200 and child_id != run.run_id
     child = wait_for_status(engine, child_id, "waiting")  # asks again from step 2
     assert child.parent_run_id == run.run_id
+
+
+def test_approving_from_the_ui_needs_the_approval_code(ui):
+    engine, base = ui
+    code = engine.set_approval_code()
+    run = engine.run(gated)
+    url = f"{base}/api/runs/{run.run_id}/signals/{run.waiting_for[0]}"
+    headers = {"X-Rewindable": "1"}
+    status, body = request(url, body={"approved": True}, headers=headers)
+    assert status == 403 and "approval code" in json.loads(body)["error"]
+    assert request(url, body={"approved": True, "code": "AAAAA-AAAAA-AAAAA-AAAAA"}, headers=headers)[0] == 403
+    assert engine.store.get_run(run.run_id).status == "waiting"
+    assert request(url, body={"approved": True, "code": code}, headers=headers)[0] == 200
+    assert wait_for_status(engine, run.run_id, "completed").output == "sent"

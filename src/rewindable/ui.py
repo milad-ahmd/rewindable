@@ -3,7 +3,8 @@
 Browse runs, inspect every step (including full model conversations), answer
 approvals, resume and rewind. It binds to 127.0.0.1 only; write requests must
 carry an ``X-Rewindable`` header and a localhost ``Host``, which blocks other
-websites from approving things through your browser.
+websites from approving things through your browser. With an approval code set,
+approving here asks for it too; the page keeps it in memory only.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from importlib import resources
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .errors import RewindableError, RunLocked, RunNotFound
+from .errors import ApprovalCodeError, RewindableError, RunLocked, RunNotFound
 from .runtime import Engine, load_workflow
 from .store import Run, StepRecord, iter_tree
 
@@ -74,6 +75,7 @@ def run_detail(engine: Engine, run_id: str) -> dict:
             for s in engine.store.signals(run.id, pending_only=True)
         ],
         "children": [r.id for r in engine.store.list_runs(limit=500) if r.parent_run_id == run.id],
+        "approval_code": engine.approval_code_required,
     }
 
 
@@ -149,7 +151,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "note": str(body.get("note") or ""),
                     }
                 )
-                self.engine.signal(run.id, parts[4], payload)
+                self.engine.signal(run.id, parts[4], payload, code=body.get("code") or None)
                 self._drive_later(run.id)
                 return self._json({"ok": True, "run_id": run.id})
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "resume":
@@ -162,6 +164,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "run_id": child.id})
         except RunNotFound as exc:
             return self._error(HTTPStatus.NOT_FOUND, f"no run {exc}")
+        except ApprovalCodeError as exc:
+            return self._error(HTTPStatus.FORBIDDEN, str(exc))
         except (KeyError, ValueError, RewindableError) as exc:
             return self._error(HTTPStatus.BAD_REQUEST, str(exc))
         self._error(HTTPStatus.NOT_FOUND, "not found")

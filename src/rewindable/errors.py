@@ -39,6 +39,13 @@ class WorkflowNotFound(RewindableError):
     """The workflow recorded for a run could not be imported."""
 
 
+class ApprovalCodeError(RewindableError):
+    """Approving needs the approval code, and it was missing or wrong.
+
+    See :mod:`rewindable.approval_code`. Rejecting never needs the code.
+    """
+
+
 class RunLocked(RewindableError):
     """Another live process is driving this run right now.
 

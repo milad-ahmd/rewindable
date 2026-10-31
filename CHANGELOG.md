@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Approval code: `rewindable approval-code set` makes approving need a code only a human holds, so an agent with a shell tool can no longer approve its own gated calls. The CLI prompts for it, the web UI has a code field, and `Engine.approve`/`signal` take `code=`. Rejecting never needs it; only its SHA-256 is stored; approvals that skip the check are read as rejections. Inspired by the decider code in [life-distributable](https://github.com/mattabate/life-distributable).
 - Fix: `rewind --to <parallel group>` replayed branches that finished before the group was resumed, so a tool inside the group was never re-run. Rewinding to a step now always re-runs everything inside it. Reported by [@mattabate](https://github.com/mattabate) in [#1](https://github.com/milad-ahmd/rewindable/issues/1).
 
 ## 0.2.0

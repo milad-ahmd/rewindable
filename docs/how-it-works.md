@@ -38,6 +38,8 @@ On replay each completed step is checked by **name and kind**. If the journal sa
 
 **`ctx.sleep(seconds)`.** The wake-up time is written into the timer step the first time it is reached, so it does not move when the run is replayed. If the time is more than a second away, the run is saved as `waiting` with `wake_at` set and control returns. `rewindable worker` resumes it once `wake_at` has passed. Approval and signal timeouts work the same way: the deadline counts from when the run first asked, and on expiry the step is completed with the default (for `approve`, a rejection).
 
+**The approval code.** `ctx.approve` marks its signal row as an approval. With an approval code set (its SHA-256 lives in the `settings` table), `Engine.signal` delivers an approving payload to such a row, or any `{"approved": true}` payload, only when given the code, and then flags the row `approved_with_code`. The check runs again where the answer is read: an approving payload without that flag is recorded as `{"approved": false, "note": "approved without the approval code"}`, so the run and every replay of it see a rejection. Plain `wait_for` signals are not affected.
+
 **Budgets.** Before each model call, the run's completed usage is summed from the journal and checked against the budget. Replayed steps count as well, so a crash-loop cannot spend past the limit. `resume --max-cost` raises the limit for one run.
 
 ## The worker

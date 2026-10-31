@@ -58,7 +58,13 @@ CREATE TABLE IF NOT EXISTS signals (
     requested_at REAL,
     delivered_at REAL,
     consumed_at  REAL,
+    approval     INTEGER NOT NULL DEFAULT 0,
+    approved_with_code INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, key)
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 CREATE INDEX IF NOT EXISTS steps_by_run ON steps (run_id, seq);
 CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status, created_at);
@@ -67,7 +73,11 @@ CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status, created_at);
 # Columns added after 0.1.0; journals created by older versions get them on open.
 MIGRATIONS = {
     "runs": {"wake_at": "REAL", "lease_owner": "TEXT", "lease_expires": "REAL"},
-    "signals": {"consumed_at": "REAL"},
+    "signals": {
+        "consumed_at": "REAL",
+        "approval": "INTEGER NOT NULL DEFAULT 0",
+        "approved_with_code": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -150,6 +160,8 @@ class Signal:
     requested_at: float | None
     delivered_at: float | None
     consumed_at: float | None = None
+    approval: bool = False  # requested by ctx.approve
+    approved_with_code: bool = False  # delivered by someone who gave the approval code
 
     @property
     def pending(self) -> bool:
@@ -359,20 +371,21 @@ class Store:
 
     # -- signals ------------------------------------------------------------
 
-    def request_signal(self, run_id: str, key: str, prompt: str | None) -> None:
+    def request_signal(self, run_id: str, key: str, prompt: str | None, *, approval: bool = False) -> None:
         self._write(
-            "INSERT INTO signals (run_id, key, prompt, requested_at) VALUES (?, ?, ?, ?)"
+            "INSERT INTO signals (run_id, key, prompt, requested_at, approval) VALUES (?, ?, ?, ?, ?)"
             " ON CONFLICT (run_id, key) DO UPDATE SET prompt = excluded.prompt,"
-            " requested_at = COALESCE(signals.requested_at, excluded.requested_at)",
-            (run_id, key, prompt, time.time()),
+            " requested_at = COALESCE(signals.requested_at, excluded.requested_at),"
+            " approval = MAX(signals.approval, excluded.approval)",
+            (run_id, key, prompt, time.time(), int(approval)),
         )
 
-    def deliver_signal(self, run_id: str, key: str, payload: Any) -> None:
+    def deliver_signal(self, run_id: str, key: str, payload: Any, *, approved_with_code: bool = False) -> None:
         self._write(
-            "INSERT INTO signals (run_id, key, payload, delivered_at) VALUES (?, ?, ?, ?)"
+            "INSERT INTO signals (run_id, key, payload, delivered_at, approved_with_code) VALUES (?, ?, ?, ?, ?)"
             " ON CONFLICT (run_id, key) DO UPDATE SET payload = excluded.payload,"
-            " delivered_at = excluded.delivered_at",
-            (run_id, key, dumps(payload), time.time()),
+            " delivered_at = excluded.delivered_at, approved_with_code = excluded.approved_with_code",
+            (run_id, key, dumps(payload), time.time(), int(approved_with_code)),
         )
 
     def consume_signal(self, run_id: str, key: str) -> None:
@@ -391,6 +404,23 @@ class Store:
         if pending_only:
             sql += " AND delivered_at IS NULL AND requested_at IS NOT NULL"
         return [_signal(r) for r in self._read(sql + " ORDER BY requested_at", params)]
+
+    # -- settings -----------------------------------------------------------
+
+    def get_setting(self, key: str) -> str | None:
+        """A stored setting, ``""`` for one that exists but is empty, ``None`` for none."""
+        rows = self._read("SELECT value FROM settings WHERE key = ?", (key,))
+        return (rows[0]["value"] or "") if rows else None
+
+    def set_setting(self, key: str, value: str | None) -> None:
+        if value is None:
+            self._write("DELETE FROM settings WHERE key = ?", (key,))
+        else:
+            self._write(
+                "INSERT INTO settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     # -- rewind -------------------------------------------------------------
 
@@ -492,6 +522,8 @@ def _signal(row: sqlite3.Row) -> Signal:
         requested_at=row["requested_at"],
         delivered_at=row["delivered_at"],
         consumed_at=row["consumed_at"],
+        approval=bool(row["approval"]),
+        approved_with_code=bool(row["approved_with_code"]),
     )
 
 

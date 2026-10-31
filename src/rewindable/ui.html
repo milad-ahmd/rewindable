@@ -56,8 +56,9 @@
   .card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
   .ask .q { font-weight: 600; margin-bottom: 10px; white-space: pre-wrap; word-break: break-word; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  input[type=text] { flex: 1; min-width: 160px; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line);
+  input[type=text], input.code { flex: 1; min-width: 160px; padding: 7px 10px; border-radius: 7px; border: 1px solid var(--line);
                      background: var(--bg); color: var(--ink); }
+  input.code { flex: 0 1 190px; min-width: 150px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 7px;
          padding: 6px 12px; cursor: pointer; font-weight: 600; font-size: 13px; }
   .btn:hover { border-color: var(--ink); }
@@ -105,7 +106,8 @@
 "use strict";
 const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-const state = { runs: [], filter: "", selected: decodeURIComponent(location.hash.slice(1)) || null, open: new Set(), notes: {} };
+// The approval code lives in this variable only: never in storage, never in the URL.
+const state = { runs: [], filter: "", selected: decodeURIComponent(location.hash.slice(1)) || null, open: new Set(), notes: {}, code: "" };
 
 async function getJSON(path) {
   const res = await fetch(path);
@@ -207,6 +209,7 @@ function renderDetail(run) {
       <div class="q">${esc(s.prompt || "A signal named " + s.key)}</div>
       <div class="row">
         <input type="text" placeholder="Note for the agent (optional)" data-note="${esc(s.key)}" value="${esc(state.notes[run.id + s.key] || "")}">
+        ${run.approval_code ? `<input type="password" class="code" placeholder="Approval code" autocomplete="off" data-code="1" value="${esc(state.code)}">` : ""}
         <button class="btn ok" data-answer="${esc(s.key)}" data-approved="1">Approve</button>
         <button class="btn bad" data-answer="${esc(s.key)}" data-approved="0">Reject</button>
       </div>
@@ -279,8 +282,11 @@ document.addEventListener("click", async (ev) => {
   const run = state.selected;
   if (t.dataset.answer) {
     const note = state.notes[run + t.dataset.answer] || "";
-    await post(`/api/runs/${encodeURIComponent(run)}/signals/${encodeURIComponent(t.dataset.answer)}`,
-               { approved: t.dataset.approved === "1", note });
+    const approved = t.dataset.approved === "1";
+    try {
+      await post(`/api/runs/${encodeURIComponent(run)}/signals/${encodeURIComponent(t.dataset.answer)}`,
+                 { approved, note, code: approved ? state.code : "" });
+    } catch (e) { state.code = ""; document.activeElement.blur(); return refresh(); }
     delete state.notes[run + t.dataset.answer];
     document.activeElement.blur();
     return setTimeout(refresh, 300);
@@ -294,6 +300,7 @@ document.addEventListener("click", async (ev) => {
 });
 document.addEventListener("input", (ev) => {
   if (ev.target.dataset.note !== undefined) state.notes[state.selected + ev.target.dataset.note] = ev.target.value;
+  if (ev.target.dataset.code) state.code = ev.target.value;
 });
 
 window.addEventListener("hashchange", () => {

@@ -21,7 +21,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import approval_code
 from .errors import (
+    ApprovalCodeError,
     BudgetExceeded,
     NestedStepError,
     NonDeterminismError,
@@ -304,6 +306,11 @@ class Context:
         worker`` resume the run. With ``timeout`` (seconds, counted from the first
         time the run asked), ``default`` is returned if nobody answers in time.
         """
+        return self._wait(signal, prompt, timeout=timeout, default=default)
+
+    def _wait(
+        self, signal: str, prompt: str | None, *, timeout: float | None, default: Any, approval: bool = False
+    ) -> Any:
         name = f"signal:{signal}"
         key = self._next_key()
         rec = self._replay(key, name, "signal")
@@ -311,8 +318,18 @@ class Context:
             return rec.output
         found = self._store.get_signal(self.run_id, signal)
         if found is not None and found.delivered_at is not None:
-            return self._finish_signal(key, name, signal, found.payload)
-        self._store.request_signal(self.run_id, signal, prompt)
+            payload = found.payload
+            if (
+                approval
+                and not found.approved_with_code
+                and approval_code.approves(payload)
+                and self._store.get_setting(approval_code.SETTING) is not None
+            ):
+                # Approved past the code check (written to the journal directly): read it
+                # as a rejection, and record that, so a replay sees the same answer.
+                payload = {"approved": False, "note": "approved without the approval code"}
+            return self._finish_signal(key, name, signal, payload)
+        self._store.request_signal(self.run_id, signal, prompt, approval=approval)
         if timeout is None:
             raise Suspended([signal])
         requested_at = self._store.get_signal(self.run_id, signal).requested_at or time.time()
@@ -339,11 +356,12 @@ class Context:
         """
         with self._counter_lock:
             position = f"{self._prefix}{self._counter + 1}"
-        payload = self.wait_for(
+        payload = self._wait(
             key or f"approve-{position}",
-            prompt=question,
+            question,
             timeout=timeout,
             default={"approved": False, "note": "no answer before the timeout"},
+            approval=True,
         )
         if isinstance(payload, dict):
             return Approval(bool(payload.get("approved")), str(payload.get("note") or ""))
@@ -527,12 +545,53 @@ class Engine:
         child = self.store.fork(run_id, to, input=input, budget=asdict(budget) if budget else ...)
         return self._drive(child, workflow or load_workflow(child.workflow))
 
-    def signal(self, run_id: str, key: str, payload: Any = None) -> None:
+    def signal(self, run_id: str, key: str, payload: Any = None, *, code: str | None = None) -> None:
+        """Deliver ``payload`` to the signal ``key``. When an approval code is set, a
+        payload that approves an approval (or looks like one: ``{"approved": true}``)
+        needs ``code``; see :mod:`rewindable.approval_code`."""
         run = self.store.get_run(run_id)
-        self.store.deliver_signal(run.id, key, payload)
+        with_code = False
+        if self.approval_code_required:
+            found = self.store.get_signal(run.id, key)
+            is_approval = found.approval if found else False
+            looks_like_one = isinstance(payload, dict) and "approved" in payload
+            if (is_approval or looks_like_one) and approval_code.approves(payload):
+                self.check_approval_code(code)
+                with_code = True
+        self.store.deliver_signal(run.id, key, payload, approved_with_code=with_code)
 
-    def approve(self, run_id: str, key: str, *, approved: bool = True, note: str = "") -> None:
-        self.signal(run_id, key, {"approved": approved, "note": note})
+    def approve(self, run_id: str, key: str, *, approved: bool = True, note: str = "", code: str | None = None) -> None:
+        """Answer ``ctx.approve``. Approving needs ``code`` once an approval code is set."""
+        self.signal(run_id, key, {"approved": approved, "note": note}, code=code)
+
+    # -- approval code -----------------------------------------------------
+
+    @property
+    def approval_code_required(self) -> bool:
+        return self.store.get_setting(approval_code.SETTING) is not None
+
+    def check_approval_code(self, code: str | None) -> None:
+        """Raise :class:`ApprovalCodeError` unless ``code`` is the approval code."""
+        stored = self.store.get_setting(approval_code.SETTING)
+        if stored is None:
+            return
+        if not code:
+            raise ApprovalCodeError("approving needs the approval code")
+        if not approval_code.matches(stored, code):
+            raise ApprovalCodeError("wrong approval code")
+
+    def set_approval_code(self, *, current: str | None = None) -> str:
+        """Make a new approval code, store its hash and return it. Show it to a human
+        once and keep it away from agents. Replacing a code needs ``current``."""
+        self.check_approval_code(current)
+        code = approval_code.new_code()
+        self.store.set_setting(approval_code.SETTING, approval_code.digest(code))
+        return code
+
+    def clear_approval_code(self, current: str) -> None:
+        """Turn the approval code off again. Needs the current code."""
+        self.check_approval_code(current)
+        self.store.set_setting(approval_code.SETTING, None)
 
     # -- workers -----------------------------------------------------------
 

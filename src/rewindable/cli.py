@@ -9,6 +9,7 @@ rewindable worker                       drive queued, due and crashed runs
 rewindable pending                      approvals and signals waiting on a human
 rewindable approve RUN KEY [--reject]   answer an approval and resume the run
 rewindable signal RUN KEY JSON          deliver any signal and resume the run
+rewindable approval-code set|clear|status   require a code only you hold to approve
 rewindable resume RUN                   continue a crashed, failed or waiting run
 rewindable rewind RUN --to STEP         branch a new run that re-executes from STEP
 """
@@ -16,6 +17,7 @@ rewindable rewind RUN --to STEP         branch a new run that re-executes from S
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -24,6 +26,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .errors import ApprovalCodeError
 from .runtime import Budget, Engine, RunResult, load_workflow
 from .store import Run, StepRecord, iter_tree
 
@@ -248,9 +251,17 @@ def cmd_pending(engine: Engine, args: argparse.Namespace) -> int:
     return 0
 
 
+def _with_code(deliver: Any) -> None:
+    """Deliver; if that needs the approval code, ask for it (never echoed) and retry."""
+    try:
+        deliver(None)
+    except ApprovalCodeError:
+        deliver(getpass.getpass("Approval code: "))
+
+
 def cmd_approve(engine: Engine, args: argparse.Namespace) -> int:
     run = engine.store.get_run(args.run)
-    engine.approve(run.id, args.key, approved=not args.reject, note=args.note or "")
+    _with_code(lambda code: engine.approve(run.id, args.key, approved=not args.reject, note=args.note or "", code=code))
     print(f"{'Rejected' if args.reject else 'Approved'} {args.key} on {run.id}.")
     if args.no_resume:
         return 0
@@ -264,10 +275,40 @@ def cmd_signal(engine: Engine, args: argparse.Namespace) -> int:
         payload = json.loads(args.payload)
     except json.JSONDecodeError:
         payload = args.payload
-    engine.signal(run.id, args.key, payload)
+    _with_code(lambda code: engine.signal(run.id, args.key, payload, code=code))
     print(f"Delivered {args.key} to {run.id}.")
     if not args.no_resume:
         print_result(engine.resume(run.id))
+    return 0
+
+
+def cmd_approval_code(engine: Engine, args: argparse.Namespace) -> int:
+    on = engine.approval_code_required
+    if args.action == "status":
+        print(
+            "Approving needs the approval code."
+            if on
+            else "No approval code is set: anyone who can reach the journal can approve."
+        )
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # The code has to be seen by a person and by nothing else, so no script,
+        # pipe or agent tool call gets to set or clear it.
+        print("approval-code set/clear only runs in an interactive terminal.", file=sys.stderr)
+        return 2
+    current = getpass.getpass("Current approval code: ") if on else None
+    if args.action == "clear":
+        if not on:
+            print("No approval code is set.")
+            return 0
+        engine.clear_approval_code(current or "")
+        print("Approval code removed. Approving no longer needs it.")
+        return 0
+    code = engine.set_approval_code(current=current)
+    print(f"\n    {paint(code, '1')}\n")
+    print("This is shown once. Keep it where your agents cannot read it: not in a file, an")
+    print("environment variable or a prompt. Approving now needs it; rejecting does not.")
+    print(dim("Lost it? Delete the approval_code row from the journal's settings table by hand."))
     return 0
 
 
@@ -351,6 +392,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("payload")
     p.add_argument("--no-resume", action="store_true")
     p.set_defaults(fn=cmd_signal)
+
+    p = sub.add_parser("approval-code", help="require a code only you hold to approve (set, clear, status)")
+    p.add_argument("action", choices=["set", "clear", "status"])
+    p.set_defaults(fn=cmd_approval_code)
 
     for name, fn, helptext in (
         ("resume", cmd_resume, "continue a crashed, failed or waiting run"),

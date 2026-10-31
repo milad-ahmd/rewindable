@@ -152,6 +152,7 @@ rewindable show RUN [--json]                step tree: timing, tokens, cost, res
 rewindable step RUN KEY                     everything recorded for one step (full model output)
 rewindable pending                          approvals and signals waiting on a human
 rewindable approve RUN KEY [--reject --note "…"]
+rewindable approval-code set|clear|status   require a code only you hold to approve
 rewindable signal RUN KEY '{"json": "payload"}'
 rewindable resume RUN [--max-cost 5]        continue a crashed, failed or waiting run
 rewindable rewind RUN --to STEP [--input '…']
@@ -164,6 +165,18 @@ Run ids accept unique prefixes. The journal lives in `.rewindable/runs.db`; over
 ### Running in production
 
 Queue work with `engine.submit(flow, input)` (or `rewindable start … --queue`) and keep one or more `rewindable worker` processes running, for example under systemd or in a container. A worker drives queued runs, wakes timers that are due, resumes runs whose approval has arrived, and takes over runs whose driver crashed (on the same machine immediately, elsewhere once the 30-second lease lapses). Several workers can share one journal safely.
+
+### Approvals your agents can't give themselves
+
+Anything that can reach the journal can answer an approval, and that includes an agent with a shell tool: it can ask for approval and then run `rewindable approve` on itself. Set an approval code to close that path:
+
+```bash
+rewindable approval-code set     # interactive only; prints the code once
+```
+
+From then on, approving needs the code: `rewindable approve` asks for it (it is never echoed), the web UI shows a code field, and `Engine.approve(..., code=…)` / `Engine.signal(..., code=…)` raise `ApprovalCodeError` without it. Rejecting never needs it. The journal keeps only its SHA-256, an approval that reaches the journal some other way is read as a rejection, and a damaged setting refuses every approval rather than allowing them. Keep the code out of files, environment variables and prompts.
+
+This is a lock on rewindable's own doors, not a sandbox: code running as your user can still edit the journal file. Give tools that run untrusted actions their own sandbox or OS user. The idea comes from the decider code in [life-distributable](https://github.com/mattabate/life-distributable).
 
 ## Models
 
