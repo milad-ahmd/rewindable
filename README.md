@@ -18,7 +18,11 @@ Agents fail in boring ways. The process dies at step 37 of 40, and you pay for s
 - **Sleep for days.** `ctx.sleep(3 * DAY)` saves the run with a wake-up time. `rewindable worker` resumes it on time, even after a reboot.
 - **Hard budgets.** `Budget(max_cost_usd=2)` is checked before every model call and counts usage across crashes and resumes.
 - **One driver per run.** Leases stop two processes from running the same workflow at once, and runs left behind by crashed processes are picked up automatically.
+- **Compare and check.** `rewindable diff <run>` shows what a rewind reused, re-ran and changed. `rewindable check` replays unfinished runs against your new code before you deploy it, without running anything.
+- **Get pinged.** `--notify-url` posts to a webhook (Slack works) the moment a run starts waiting for a human.
 - **See everything.** `rewindable ui` opens a local web view of every run, step and model conversation, with approve, resume and rewind buttons. `rewindable show <run>` gives the same view in the terminal.
+
+![rewindable in a terminal: a research run crashes, resumes without paying for its first 9 steps again, then a currency bug is fixed and the run is rewound to the broken step](https://raw.githubusercontent.com/milad-ahmd/rewindable/main/docs/demo.gif)
 
 ![The rewindable web UI: a run waiting for a human to approve a refund](https://raw.githubusercontent.com/milad-ahmd/rewindable/main/docs/ui.jpg)
 
@@ -121,11 +125,13 @@ print(result.status, result.output)  # "waiting" until someone runs `rewindable 
 | `ctx.parallel([branch, …])` | Runs `branch(child_ctx)` concurrently; each branch journals its own steps. |
 | `ctx.approve(question, timeout=…)` / `ctx.wait_for(signal, timeout=…, default=…)` | Suspends the run until a human or another system answers, optionally with a deadline. |
 | `ctx.sleep(seconds)` | A durable timer: short waits sleep in-process, long ones suspend the run until a worker wakes it. |
+| `ctx.patched("change-id")` | True for runs that reach this point on new code; False for runs that went past it on the old code. |
 | `ctx.now()` / `ctx.uuid()` | Time and randomness, recorded so replays see the same values. |
 | `current_step().idempotency_key` | Inside a step: a key that stays the same across retries and resumes, for payment and email APIs. |
 | `Agent(name, model, tools=…, instructions=…)` | A tool-use loop where every model turn and tool call is a step. |
 | `agent.as_tool()` | Lets one agent delegate to another (supervisor and specialist teams). |
 | `Engine.run / submit / resume / rewind / signal / approve / work` | Run lifecycle and a worker loop, also available from the CLI. |
+| `Engine.check(run_id)` / `diff_runs(store, a, b)` | Dry-replay a run against the current code; compare two runs step by step. |
 
 ## The one rule: same inputs, same steps
 
@@ -141,7 +147,7 @@ started = ctx.now()
 data = ctx.step("fetch", lambda: requests.get(url).json())
 ```
 
-If you change the workflow so that step 4 is now a different step, `resume` raises `NonDeterminismError` instead of feeding the wrong cached result to the wrong code. Use `rewind --to 4` to branch from the last step that still matches. [How it works](https://github.com/milad-ahmd/rewindable/blob/main/docs/how-it-works.md) covers the journal, step keys, parallel branches and the exact guarantees.
+If you change the workflow so that step 4 is now a different step, `resume` raises `NonDeterminismError` instead of feeding the wrong cached result to the wrong code. Use `rewind --to 4` to branch from the last step that still matches, run `rewindable check` before deploying to find such runs, and wrap deliberate changes in `ctx.patched` (below). [How it works](https://github.com/milad-ahmd/rewindable/blob/main/docs/how-it-works.md) covers the journal, step keys, parallel branches and the exact guarantees.
 
 ## CLI
 
@@ -150,6 +156,8 @@ rewindable ui                               local web UI: runs, steps, conversat
 rewindable runs [--status waiting]          list recent runs, with cost
 rewindable show RUN [--json]                step tree: timing, tokens, cost, results
 rewindable step RUN KEY                     everything recorded for one step (full model output)
+rewindable diff RUN_A [RUN_B] [--json]      what changed between two runs (one run: a rewind vs. its parent)
+rewindable check [WORKFLOW] [--run RUN] [--status S] [--json]   replay runs against the current code, run nothing
 rewindable pending                          approvals and signals waiting on a human
 rewindable approve RUN KEY [--reject --note "…"]
 rewindable approval-code set|clear|status   require a code only you hold to approve
@@ -160,11 +168,68 @@ rewindable start app.py:flow --input '…' [--queue]
 rewindable worker [--once]                  drive queued runs, due timers, answered approvals, crashed runs
 ```
 
-Run ids accept unique prefixes. The journal lives in `.rewindable/runs.db`; override it with `--db` or `REWINDABLE_DB`. Because the journal is one SQLite file in WAL mode, any process on the machine can approve, resume or work on a run.
+`start`, `resume`, `rewind`, `approve`, `signal`, `worker` and `ui` take `--notify-url URL` (or `REWINDABLE_NOTIFY_URL`). Run ids accept unique prefixes. The journal lives in `.rewindable/runs.db`; override it with `--db` or `REWINDABLE_DB`. Because the journal is one SQLite file in WAL mode, any process on the machine can approve, resume or work on a run.
 
 ### Running in production
 
 Queue work with `engine.submit(flow, input)` (or `rewindable start … --queue`) and keep one or more `rewindable worker` processes running, for example under systemd or in a container. A worker drives queued runs, wakes timers that are due, resumes runs whose approval has arrived, and takes over runs whose driver crashed (on the same machine immediately, elsewhere once the 30-second lease lapses). Several workers can share one journal safely.
+
+### What did the rewind change?
+
+`rewindable diff RUN` compares a rewound run with the run it came from (or give two runs). Every step is aligned by key and marked `=` reused (copied by the rewind, not run again), `≈` re-run with the same result, `~` changed, `-` only in A or `+` only in B, followed by both runs' steps, tokens, cost and output. The web UI shows the same comparison on a rewound run's page. Model steps are compared by their content, not by token counts or tool-call ids.
+
+```text
+$ rewindable diff run_da0763d578f3          # examples/04_rewind_and_fix.py, after the fix
+A run_dcb9c94f1a76  completed   B run_da0763d578f3  completed
+B was rewound from A at step 2
+
+= 1      fx:llm                        reused     → convert
+~ 2      tool:convert                  changed    231.48 → 270.0
+~ 3      fx:llm                        changed    250 EUR is 231.48 USD. → 250 EUR is 270.0 USD.
+
+1 reused · 2 changed
+
+         A                              B
+status   completed                      completed
+steps    3 (3 executed)                 3 (1 reused, 2 executed)
+tokens   3,000                          3,000
+cost     $0.0216                        $0.0216  ($0.0108 new)
+Δ cost                                  +$0.0000
+A output: 250 EUR is 231.48 USD.
+B output: 250 EUR is 270.0 USD.
+```
+
+### Check new code against runs in flight
+
+Runs waiting for an approval or a timer will resume on whatever code is deployed then. `rewindable check` replays every unfinished run (or `--run`, `--status`, or the runs of one `WORKFLOW`) against the code on disk now, without executing anything: journaled steps return their recorded results, and the first step without one ends the check, because that is where a resume would carry on. No step function, model call, signal or timer runs and the journal is not written. It exits 1 if any run would fail with `NonDeterminismError` (or cannot be imported), so it fits in CI before a deploy. In Python: `Engine().check(run_id)`.
+
+```text
+$ rewindable check                            # a run waiting for an approval, same code
+run_d50079bc32a1   waiting    ok  replays 1 step, a resume continues at 2 (signal:approve-2)
+
+$ rewindable check --status completed         # after renaming a tool the model had already called
+run_d50079bc32a1   completed  diverges at step 2: journal signal signal:approve-2, code llm fx:llm
+```
+
+To change a workflow that has runs in flight, branch on `ctx.patched("change-id")`. A run that reaches that point for the first time records a marker step and takes the new path; a run whose journal already has a different step there went past it on the old code and gets `False`. Once those runs are gone, delete the old branch but keep the call, since runs that recorded the marker need it to line up.
+
+```python
+if ctx.patched("convert-v2"):
+    usd = ctx.step("tool:convert_currency", convert_currency, amount)
+else:
+    usd = ctx.step("tool:convert", convert, amount)
+```
+
+### Get told when a run needs you
+
+Pass `--notify-url` to the processes that drive runs (or set `REWINDABLE_NOTIFY_URL`), and every time a run starts waiting on `ctx.approve` or `ctx.wait_for`, rewindable POSTs:
+
+```json
+{"run_id": "run_7f…", "workflow": "/app/flow.py:refund", "key": "approve-3", "prompt": "Refund €129?",
+ "approval": true, "requested_at": 1793000000.0, "ui_hint": "rewindable approve run_7f… approve-3"}
+```
+
+A `hooks.slack.com` URL gets Slack's `{"text": …}` message instead. Each signal is announced once, however often the run is resumed or by how many workers. A failed or slow (5 s) notification only prints a warning: the run is already saved as waiting. The message never contains step outputs or the approval code. In Python, pass any callable: `Engine(on_waiting=webhook(url))` or `Engine(on_waiting=lambda w: page(w.run_id, w.prompt))`; it receives a `Waiting(run_id, workflow, key, prompt, approval, requested_at)`.
 
 ### Approvals your agents can't give themselves
 
@@ -199,6 +264,7 @@ This is an alpha. The core semantics are tested (a real crash in a subprocess, r
 
 - [x] A local web UI for the run timeline (`rewindable ui`)
 - [x] Durable timers, approval timeouts and a background worker
+- [x] Run diffs, dry-replay checks before deploys, and waiting notifications
 - [ ] `async` workflows and `asyncio`-native parallel branches
 - [ ] Postgres journal backend for multi-machine workers
 - [ ] OpenTelemetry export of steps as spans
