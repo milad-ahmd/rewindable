@@ -3,6 +3,8 @@
 rewindable runs                         list recent runs
 rewindable show RUN [--json]            step-by-step timeline of a run
 rewindable step RUN KEY                 everything recorded for one step
+rewindable diff RUN_A [RUN_B]           what changed between two runs (default: a rewind and its parent)
+rewindable check [WORKFLOW]             replay unfinished runs against the current code, run nothing
 rewindable ui                           local web UI: browse, approve, resume, rewind
 rewindable start FILE.py:FN [--input J] start a workflow (or --queue it for a worker)
 rewindable worker                       drive queued, due and crashed runs
@@ -20,14 +22,17 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .errors import ApprovalCodeError
-from .runtime import Budget, Engine, RunResult, load_workflow
+from . import notify
+from .diff import CHANGED, ONLY_A, ONLY_B, REUSED, SAME, RunTotals, diff_runs
+from .errors import ApprovalCodeError, RunNotFound
+from .runtime import Budget, CheckResult, Engine, RunResult, load_workflow
 from .store import Run, StepRecord, iter_tree
 
 _COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -77,6 +82,8 @@ def step_summary(step: StepRecord) -> str:
         return dim("in progress")
     if step.kind == "timer":
         return "slept"
+    if step.kind == "patch":
+        return "new code path"
     if step.kind == "llm" and isinstance(step.output, dict):
         uses = [b["name"] for b in step.output.get("content", []) if b.get("type") == "tool_use"]
         text = "".join(b.get("text", "") for b in step.output.get("content", []) if b.get("type") == "text")
@@ -195,6 +202,145 @@ def cmd_step(engine: Engine, args: argparse.Namespace) -> int:
         out = step.output
         print(out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, indent=2))
     return 0
+
+
+_DIFF_MARK = {REUSED: "=", SAME: "≈", CHANGED: "~", ONLY_A: "-", ONLY_B: "+"}
+_DIFF_WORD = {REUSED: "reused", SAME: "same", CHANGED: "changed", ONLY_A: "only in A", ONLY_B: "only in B"}
+_DIFF_COLOR = {REUSED: "2", SAME: "0", CHANGED: "33", ONLY_A: "31", ONLY_B: "32"}
+
+
+def cmd_diff(engine: Engine, args: argparse.Namespace) -> int:
+    try:
+        first = engine.store.get_run(args.run_a)
+        second = engine.store.get_run(args.run_b) if args.run_b else None
+    except RunNotFound as exc:
+        print(f"error: no run {exc}", file=sys.stderr)
+        return 2
+    if second is None:
+        if not first.parent_run_id:
+            print(f"error: {first.id} was not rewound from another run; give two runs to compare", file=sys.stderr)
+            return 2
+        first, second = engine.store.get_run(first.parent_run_id), first
+    diff = diff_runs(engine.store, first.id, second.id)
+    if args.json:
+        print(json.dumps(diff.to_dict(), ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    a, b = diff.a.run, diff.b.run
+    print(f"{paint('A', '1')} {a.id}  {status(a.status)}   {paint('B', '1')} {b.id}  {status(b.status)}")
+    if b.parent_run_id == a.id:
+        print(dim(f"B was rewound from A at step {b.forked_at}"))
+    elif a.parent_run_id == b.id:
+        print(dim(f"A was rewound from B at step {a.forked_at}"))
+    if a.workflow != b.workflow:
+        print(dim(f"workflows differ: {a.workflow} vs {b.workflow}"))
+    print()
+    for step in diff.steps:
+        shown = step.b or step.a
+        label = f"{'  ' * step.depth}{_DIFF_MARK[step.change]} {step.key:<6} {shown.name}"
+        word = _DIFF_WORD[step.change]
+        if step.change == CHANGED:
+            detail = _change(step.a, step.b)
+        elif step.change == ONLY_A:
+            detail = step_summary(step.a)
+        else:
+            detail = step_summary(step.b)
+        line = f"{label:<38} {word:<10} {detail}"
+        print(paint(line, _DIFF_COLOR[step.change]) if step.change != SAME else line)
+    print()
+    counts = diff.counts()
+    print(dim(" · ".join(f"{counts[c]} {_DIFF_WORD[c]}" for c in _DIFF_WORD if counts[c])))
+    print()
+    rows = [
+        ("status", status(a.status), status(b.status)),
+        ("steps", _ran(diff.a), _ran(diff.b)),
+        ("tokens", f"{diff.a.tokens:,}", f"{diff.b.tokens:,}"),
+        ("cost", money(diff.a.cost_usd), f"{money(diff.b.cost_usd)}  ({money(diff.b.new_cost_usd)} new)"),
+    ]
+    rows.append(("Δ cost", "", f"{'+' if diff.cost_delta >= 0 else '-'}{money(abs(diff.cost_delta))}"))
+    print(dim(f"{'':8} {'A':30} B"))
+    for name, left, right in rows:
+        print(f"{dim(f'{name:8}')} {left}{' ' * (30 - len(_plain(left)))} {right}")
+    for side, run in (("A", a), ("B", b)):
+        if run.status == "completed":
+            print(f"{side} output: {preview(run.output, 160)}")
+        elif run.status == "failed" and run.error:
+            print(paint(f"{side} error: {run.error.strip().splitlines()[-1]}", "31"))
+    return 0
+
+
+def _change(a: StepRecord, b: StepRecord) -> str:
+    if (a.name, a.kind) != (b.name, b.kind):
+        return f"{a.kind} {a.name} → {b.kind} {b.name}"
+    before, after = preview(_plain(step_summary(a)), 36), preview(_plain(step_summary(b)), 36)
+    if a.status != b.status:
+        before, after = f"{a.status}: {before}", f"{b.status}: {after}"
+    if before == after:  # the summaries match; the difference is further in
+        return f"{before}  {dim(f'(rewindable step RUN {a.key} shows each in full)')}"
+    return f"{before} → {after}"
+
+
+def _ran(totals: RunTotals) -> str:
+    if not totals.reused:
+        return f"{totals.steps} ({totals.executed} executed)"
+    return f"{totals.steps} ({totals.reused} reused, {totals.executed} executed)"
+
+
+def _plain(text: str) -> str:
+    """``text`` without color codes."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def cmd_check(engine: Engine, args: argparse.Namespace) -> int:
+    try:
+        runs = [engine.store.get_run(r) for r in args.run or []]
+    except RunNotFound as exc:
+        print(f"error: no run {exc}", file=sys.stderr)
+        return 2
+    if not runs:
+        for state in args.status or ["queued", "running", "waiting", "failed"]:
+            runs.extend(engine.store.list_runs(status=state, limit=100_000))
+        runs.sort(key=lambda r: r.created_at)
+    if args.workflow:
+        runs = [r for r in runs if _matches(r.workflow, args.workflow)]
+    results = [engine.check(r.id) for r in runs]
+    if args.json:
+        print(json.dumps([{**asdict(r), "ok": r.ok} for r in results], ensure_ascii=False, indent=2))
+    elif not results:
+        print("No runs to check.")
+    else:
+        for result in results:
+            print(f"{result.run_id:18} {status(f'{result.status:10}')} {_verdict(result)}")
+        bad = [r for r in results if not r.ok]
+        print()
+        print(dim(f"{plural(len(results), 'run')} checked: {len(results) - len(bad)} ok, {len(bad)} not"))
+        for result in bad:
+            if result.outcome == "diverged":
+                print(dim(f"  {result.run_id}: rewind it to step {result.key} to re-run from there with the new code"))
+    return 1 if any(not r.ok for r in results) else 0
+
+
+def _verdict(result: CheckResult) -> str:
+    if result.outcome == "ok":
+        replayed = plural(result.replayed_steps, "step")
+        if result.resumes_at is None:
+            return f"{paint('ok', '32')}  replays all {replayed} to the end"
+        where = f"{result.resumes_at} ({result.next_step})"
+        return f"{paint('ok', '32')}  replays {replayed}, a resume continues at {where}"
+    if result.outcome == "diverged":
+        return paint(f"diverges at step {result.key}: journal {result.journal}, code {result.code}", "31")
+    if result.outcome == "unloadable":
+        return paint(f"can't import workflow: {result.error}", "31")
+    return paint(f"fails while replaying: {result.error}", "31")
+
+
+def _matches(recorded: str, wanted: str) -> bool:
+    """A run's workflow against ``app.py:flow``, ``app.py``, ``pkg.mod:flow`` or ``pkg.mod``."""
+    path, colon, name = wanted.rpartition(":") if ":" in wanted else (wanted, "", "")
+    if path.endswith(".py"):
+        path = str(Path(path).resolve())
+    module, _, qualname = recorded.rpartition(":")
+    return module == path and (not colon or qualname == name)
 
 
 def cmd_ui(engine: Engine, args: argparse.Namespace) -> int:
@@ -356,14 +502,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("key", help="step key, as shown by `show`")
     p.set_defaults(fn=cmd_step)
 
+    p = sub.add_parser("diff", help="compare two runs step by step (one run: compare a rewind with its parent)")
+    p.add_argument("run_a", metavar="RUN_A")
+    p.add_argument("run_b", metavar="RUN_B", nargs="?", help="default: the run RUN_A was rewound from, then RUN_A")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_diff)
+
+    p = sub.add_parser("check", help="replay runs against the current code without running anything new")
+    p.add_argument("workflow", nargs="?", help="only runs of this workflow: file.py[:fn] or module[:fn]")
+    p.add_argument("--run", action="append", help="check this run (repeatable); default: every unfinished run")
+    p.add_argument(
+        "--status",
+        action="append",
+        choices=["queued", "running", "waiting", "failed", "completed"],
+        help="check runs with this status (repeatable; default: all but completed)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_check)
+
     p = sub.add_parser("ui", help="open the local web UI")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-browser", action="store_true")
+    _notify_arg(p)
     p.set_defaults(fn=cmd_ui)
 
     p = sub.add_parser("worker", help="drive queued runs, due timers, answered approvals and crashed runs")
     p.add_argument("--once", action="store_true", help="drive what is ready now, then exit")
     p.add_argument("--poll", type=float, default=1.0, help="seconds between checks")
+    _notify_arg(p)
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("start", help="start a workflow: path/to/file.py:function or package.module:function")
@@ -372,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--queue", action="store_true", help="only queue it; a worker will run it")
     p.add_argument("--max-cost", type=float)
     p.add_argument("--max-tokens", type=int)
+    _notify_arg(p)
     p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("pending", help="list approvals and signals waiting on a human")
@@ -384,6 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reject", action="store_true")
     p.add_argument("--note", help="explanation passed back to the agent")
     p.add_argument("--no-resume", action="store_true", help="record the answer without resuming")
+    _notify_arg(p)
     p.set_defaults(fn=cmd_approve)
 
     p = sub.add_parser("signal", help="deliver a signal payload (JSON) and resume")
@@ -391,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("key")
     p.add_argument("payload")
     p.add_argument("--no-resume", action="store_true")
+    _notify_arg(p)
     p.set_defaults(fn=cmd_signal)
 
     p = sub.add_parser("approval-code", help="require a code only you hold to approve (set, clear, status)")
@@ -408,13 +577,24 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--input", help="replace the run's input (JSON)")
         p.add_argument("--max-cost", type=float, help="new cost budget in USD")
         p.add_argument("--max-tokens", type=int, help="new token budget")
+        _notify_arg(p)
         p.set_defaults(fn=fn)
     return parser
+
+
+def _notify_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--notify-url",
+        help=f"POST to this URL when a run starts waiting for a human (default: ${notify.ENV}; Slack webhooks work)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     engine = Engine(args.db)
+    if hasattr(args, "notify_url"):  # only commands that drive runs take it
+        url = args.notify_url or os.environ.get(notify.ENV)
+        engine.on_waiting = notify.webhook(url) if url else None
     try:
         return args.fn(engine, args)
     except Exception as exc:  # noqa: BLE001 - CLI boundary

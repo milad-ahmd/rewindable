@@ -18,6 +18,7 @@ from importlib import resources
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .diff import diff_runs
 from .errors import ApprovalCodeError, RewindableError, RunLocked, RunNotFound
 from .runtime import Engine, load_workflow
 from .store import Run, StepRecord, iter_tree
@@ -131,6 +132,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json([run_summary(self.engine, r) for r in runs])
             if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                 return self._json(run_detail(self.engine, parts[2]))
+            if len(parts) == 5 and parts[:2] == ["api", "runs"] and parts[3] == "diff":
+                return self._json(diff_runs(self.engine.store, parts[2], parts[4]).to_dict())
         except RunNotFound as exc:
             return self._error(HTTPStatus.NOT_FOUND, f"no run {exc}")
         self._error(HTTPStatus.NOT_FOUND, "not found")

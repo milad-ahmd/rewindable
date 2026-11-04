@@ -10,7 +10,7 @@ Everything lives in one SQLite database (`.rewindable/runs.db` by default) in WA
 |---|---|---|
 | `runs` | workflow run | workflow reference, input, status (`queued` / `running` / `waiting` / `completed` / `failed`), output or error, budget, the run it was rewound from, timer wake-up time, and the current driver's lease |
 | `steps` | step of a run | key, name, kind (`step` / `llm` / `parallel` / `signal`), status, JSON output or error, attempts, tokens, cost, timings |
-| `signals` | signal a run waited for | the prompt shown to the human, the delivered payload, and when it was requested, delivered and consumed |
+| `signals` | signal a run waited for | the prompt shown to the human, the delivered payload, and when it was requested, delivered, consumed and announced to `on_waiting` |
 
 A run's workflow is stored as an importable reference: `package.module:function`, or `/abs/path/script.py:function` for scripts. That is how `rewindable resume` in a fresh process finds your code again. The script's folder goes on `sys.path` the way `python script.py` does it, and the script is imported under a module name other than `__main__`, so its `if __name__ == "__main__":` block does not run again.
 
@@ -21,6 +21,8 @@ Every call to `ctx.step`, `ctx.llm`, `ctx.parallel`, `ctx.wait_for` or `ctx.appr
 Parallel branches get their own counters under the group's key. Branch *i* of group `3` produces `3.i.1`, `3.i.2`, … so concurrent branches never compete for keys, and the keys are the same no matter which thread finishes first. Groups nest: `3.1.2.0.1` is the first step of branch 0 of a group that is step 2 of branch 1 of group 3.
 
 On replay each completed step is checked by **name and kind**. If the journal says key 4 was `tool:search` and the code now asks for `llm:writer` at key 4, the run fails with `NonDeterminismError`. That is better than handing the writer the search result.
+
+`ctx.patched("id")` is the one call that takes a key only sometimes. It looks at the next key: if the journal has the `patch:id` marker there, it replays it and returns True; if the journal has any other step there, the run went past this point on the old code, so it returns False and leaves the key to the old path's step; if the journal has nothing there, it records the marker and returns True. The decision depends only on the journal, so it is the same on every replay.
 
 ## What happens on…
 
@@ -34,11 +36,15 @@ On replay each completed step is checked by **name and kind**. If the journal sa
 
 **`resume`.** The workflow function is called again from the top. Completed steps return instantly from the journal, and the first unfinished step runs for real. `RunResult.replayed_steps` and `saved_usd` tell you how much was skipped.
 
+**`check` (a dry replay).** `Engine.check` calls the workflow with a context in dry mode and takes no lease. A step whose key has a completed record goes through the same name-and-kind check as a resume and returns its recorded output. The first step without one (missing, failed, still running, or a signal that was delivered but not yet consumed) raises an internal `Unrecorded` signal instead of running, which ends the check: that is where a resume would start executing, so whatever the new code does there is not a replay problem. A parallel group that has not completed is checked branch by branch, one after another, each up to its own first unrecorded step; only if every branch replays to its end does the check go on past the group. Nothing in dry mode writes to the journal, and like `Suspended`, `Unrecorded` derives from `BaseException` so a broad `except Exception` in the workflow cannot swallow it. Code outside steps does run, as it does on every resume.
+
 **`rewind --to K`.** A new run is created with the same workflow and input (or a new `--input`). Every completed step that **started before K** is copied into it, except steps that *enclose* K (the parallel group around K is re-run, so that K runs again). The new run then executes normally. The original run is never modified, and `rewindable runs` shows the new one as `⑂ parent@K`.
 
 **`ctx.sleep(seconds)`.** The wake-up time is written into the timer step the first time it is reached, so it does not move when the run is replayed. If the time is more than a second away, the run is saved as `waiting` with `wake_at` set and control returns. `rewindable worker` resumes it once `wake_at` has passed. Approval and signal timeouts work the same way: the deadline counts from when the run first asked, and on expiry the step is completed with the default (for `approve`, a rejection).
 
 **The approval code.** `ctx.approve` marks its signal row as an approval. With an approval code set (its SHA-256 lives in the `settings` table), `Engine.signal` delivers an approving payload to such a row, or any `{"approved": true}` payload, only when given the code, and then flags the row `approved_with_code`. The check runs again where the answer is read: an approving payload without that flag is recorded as `{"approved": false, "note": "approved without the approval code"}`, so the run and every replay of it see a rejection. Plain `wait_for` signals are not affected.
+
+**Waiting notifications.** When a drive ends with the run suspended on signals, and after its lease is released (so whoever answers can resume it at once), the engine calls `on_waiting` for each of those signals that is still pending. Before each call it sets the signal's `notified_at` with a conditional `UPDATE` and skips the signal if that was already set, so each signal is announced at most once across resumes, processes and workers. An exception from `on_waiting` is printed to stderr and otherwise ignored.
 
 **Budgets.** Before each model call, the run's completed usage is summed from the journal and checked against the budget. Replayed steps count as well, so a crash-loop cannot spend past the limit. `resume --max-cost` raises the limit for one run.
 

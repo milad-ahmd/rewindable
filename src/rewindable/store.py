@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS signals (
     consumed_at  REAL,
     approval     INTEGER NOT NULL DEFAULT 0,
     approved_with_code INTEGER NOT NULL DEFAULT 0,
+    notified_at  REAL,
     PRIMARY KEY (run_id, key)
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -77,6 +78,7 @@ MIGRATIONS = {
         "consumed_at": "REAL",
         "approval": "INTEGER NOT NULL DEFAULT 0",
         "approved_with_code": "INTEGER NOT NULL DEFAULT 0",
+        "notified_at": "REAL",
     },
 }
 
@@ -162,6 +164,7 @@ class Signal:
     consumed_at: float | None = None
     approval: bool = False  # requested by ctx.approve
     approved_with_code: bool = False  # delivered by someone who gave the approval code
+    notified_at: float | None = None  # when on_waiting was told about it
 
     @property
     def pending(self) -> bool:
@@ -391,6 +394,16 @@ class Store:
     def consume_signal(self, run_id: str, key: str) -> None:
         self._write("UPDATE signals SET consumed_at = ? WHERE run_id = ? AND key = ?", (time.time(), run_id, key))
 
+    def claim_notification(self, run_id: str, key: str) -> bool:
+        """Mark a pending signal as notified. True for exactly one caller, so a run that
+        is resumed or picked up by several workers tells a human about it only once."""
+        cursor = self._write(
+            "UPDATE signals SET notified_at = ? WHERE run_id = ? AND key = ?"
+            " AND notified_at IS NULL AND delivered_at IS NULL",
+            (time.time(), run_id, key),
+        )
+        return cursor.rowcount == 1
+
     def get_signal(self, run_id: str, key: str) -> Signal | None:
         rows = self._read("SELECT * FROM signals WHERE run_id = ? AND key = ?", (run_id, key))
         return _signal(rows[0]) if rows else None
@@ -524,6 +537,7 @@ def _signal(row: sqlite3.Row) -> Signal:
         consumed_at=row["consumed_at"],
         approval=bool(row["approval"]),
         approved_with_code=bool(row["approved_with_code"]),
+        notified_at=row["notified_at"],
     )
 
 

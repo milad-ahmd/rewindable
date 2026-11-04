@@ -81,6 +81,8 @@
   .block .label { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
   .err { color: var(--bad); }
   .toolbar { display: flex; gap: 8px; margin-top: 8px; }
+  .d-changed { color: var(--warn); } .d-only_a { color: var(--bad); } .d-only_b { color: var(--ok); }
+  .d-reused td { color: var(--muted); }
   @media (max-width: 760px) {
     main { grid-template-columns: 1fr; }
     aside { position: static; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -107,7 +109,7 @@
 const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 // The approval code lives in this variable only: never in storage, never in the URL.
-const state = { runs: [], filter: "", selected: decodeURIComponent(location.hash.slice(1)) || null, open: new Set(), notes: {}, code: "" };
+const state = { runs: [], filter: "", selected: decodeURIComponent(location.hash.slice(1)) || null, open: new Set(), notes: {}, code: "", compare: new Set() };
 
 async function getJSON(path) {
   const res = await fetch(path);
@@ -154,6 +156,7 @@ function summary(step) {
   if (step.kind === "signal" && out && typeof out === "object" && "approved" in out)
     return (out.approved ? "approved" : "rejected") + (out.note ? " (" + out.note + ")" : "");
   if (step.kind === "timer") return "slept";
+  if (step.kind === "patch") return "new code path";
   if (step.name.startsWith("tool:") && out && "ok" in out) return out.ok ? preview(out.value) : "error: " + out.error;
   return preview(out);
 }
@@ -201,7 +204,31 @@ function renderList() {
   badge.textContent = pending + " waiting on you";
 }
 
-function renderDetail(run) {
+const DIFF = { reused: ["=", "reused"], same: ["≈", "same"], changed: ["~", "changed"], only_a: ["-", "only in parent"], only_b: ["+", "only here"] };
+
+function renderDiff(diff) {
+  const rows = diff.steps.map((s) => {
+    const [mark, word] = DIFF[s.change];
+    const shown = s.b || s.a;
+    let detail = s.change === "only_a" ? summary(s.a) : summary(s.b);
+    if (s.change === "changed") {
+      detail = s.a.name !== s.b.name ? s.a.name + " → " + s.b.name : preview(summary(s.a), 40) + " → " + preview(summary(s.b), 40);
+    }
+    return `<tr class="d-${esc(s.change)}">
+        <td class="key mono" style="padding-left:${8 + s.depth * 18}px"><span class="mark">${esc(mark)}</span> ${esc(s.key)}</td>
+        <td class="name k-${esc(shown.kind)}">${esc(shown.name)}</td>
+        <td class="num">${esc(word)}</td>
+        <td class="sum">${esc(detail)}</td>
+      </tr>`;
+  }).join("");
+  const c = diff.counts, d = diff.cost_delta_usd;
+  return `<div class="card"><h3>Compared with parent ${esc(diff.a.id)}</h3>
+    <div class="meta">${c.reused} reused · ${c.same} re-run, same result · ${c.changed} changed · ${c.only_a} only in parent · ${c.only_b} only here
+      · this run spent ${money(diff.b.new_cost_usd) || "$0"} (${d >= 0 ? "+" : "-"}${money(Math.abs(d)) || "$0"} vs parent)</div>
+    <table>${rows}</table></div>`;
+}
+
+function renderDetail(run, diff) {
   const canResume = ["failed", "running", "waiting", "queued"].includes(run.status);
   const signals = run.signals.map((s) => `
     <div class="card ask">
@@ -229,7 +256,8 @@ function renderDetail(run) {
     ? `<div class="card"><h3>Output</h3><pre>${esc(typeof run.output === "string" ? run.output : JSON.stringify(run.output, null, 2))}</pre></div>`
     : run.status === "failed" && run.error ? `<div class="card"><h3 class="err">Error</h3><pre class="err">${esc(run.error)}</pre></div>` : "";
   const lineage = [
-    run.parent_run_id ? `rewound from <a data-go="${esc(run.parent_run_id)}">${esc(run.parent_run_id)}</a> at step ${esc(run.forked_at)}` : "",
+    run.parent_run_id ? `rewound from <a data-go="${esc(run.parent_run_id)}">${esc(run.parent_run_id)}</a> at step ${esc(run.forked_at)}
+      (<a data-compare="1">${diff ? "hide comparison" : "compare with parent"}</a>)` : "",
     run.children.length ? "rewinds: " + run.children.map((c) => `<a data-go="${esc(c)}">${esc(c)}</a>`).join(", ") : "",
     run.wake_at && run.status === "waiting" ? "timer wakes in " + until(run.wake_at) : "",
   ].filter(Boolean).join(" · ");
@@ -245,6 +273,7 @@ function renderDetail(run) {
       <div class="stat"><b>${money(run.cost_usd) || "$0"}</b><span>cost${run.budget && run.budget.max_cost_usd ? " of $" + run.budget.max_cost_usd + " budget" : ""}</span></div>
     </div>
     ${signals}
+    ${diff ? renderDiff(diff) : ""}
     <div class="card"><h3>Input</h3><pre>${esc(typeof run.input === "string" ? run.input : JSON.stringify(run.input, null, 2))}</pre></div>
     <div class="card"><h3>Steps · click one to inspect it</h3><table>${rows || `<tr><td class="meta">No steps yet.</td></tr>`}</table></div>
     ${result}`;
@@ -255,7 +284,12 @@ async function refresh() {
     state.runs = await getJSON("/api/runs");
     renderList();
     const typing = document.activeElement && document.activeElement.matches("#detail input");
-    if (state.selected && !typing) renderDetail(await getJSON("/api/runs/" + encodeURIComponent(state.selected)));
+    if (state.selected && !typing) {
+      const run = await getJSON("/api/runs/" + encodeURIComponent(state.selected));
+      const diff = run.parent_run_id && state.compare.has(state.selected)
+        ? await getJSON(`/api/runs/${encodeURIComponent(run.parent_run_id)}/diff/${encodeURIComponent(run.id)}`) : null;
+      renderDetail(run, diff);
+    }
   } catch (e) {
     if (state.selected) $("#detail").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
@@ -268,11 +302,15 @@ function select(id) {
 }
 
 document.addEventListener("click", async (ev) => {
-  const t = ev.target.closest("[data-run],[data-filter],[data-step],[data-answer],[data-resume],[data-rewind],[data-go],#pending");
+  const t = ev.target.closest("[data-run],[data-filter],[data-step],[data-answer],[data-resume],[data-rewind],[data-go],[data-compare],#pending");
   if (!t) return;
   if (t.id === "pending") { state.filter = "waiting"; return refresh(); }
   if (t.dataset.run) return select(t.dataset.run);
   if (t.dataset.go) return select(t.dataset.go);
+  if (t.dataset.compare) {
+    state.compare.has(state.selected) ? state.compare.delete(state.selected) : state.compare.add(state.selected);
+    return refresh();
+  }
   if (t.dataset.filter !== undefined) { state.filter = t.dataset.filter; return renderList(); }
   if (t.dataset.step) {
     const k = state.selected + t.dataset.step;

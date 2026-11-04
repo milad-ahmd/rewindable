@@ -20,6 +20,12 @@ class NonDeterminismError(RewindableError):
     Use ``rewind`` to branch a new run from the last step that still matches.
     """
 
+    def __init__(self, message: str, *, key: str = "", journal: str = "", code: str = ""):
+        super().__init__(message)
+        self.key = key  # where the two disagree
+        self.journal = journal  # what the journal recorded there, e.g. "step 'fetch'"
+        self.code = code  # what the code calls there now
+
 
 class BudgetExceeded(RewindableError):
     """The run hit one of its budget limits before making another model call."""
@@ -66,3 +72,16 @@ class Suspended(BaseException):
         super().__init__(", ".join(keys) or f"timer until {wake_at}")
         self.keys = keys
         self.wake_at = wake_at
+
+
+class Unrecorded(BaseException):
+    """Internal control-flow signal for a dry replay (:meth:`Engine.check`): the
+    workflow reached a step the journal has no result for, which is where a real
+    resume would start executing. Like :class:`Suspended`, user code does not catch it.
+    """
+
+    def __init__(self, key: str, kind: str, name: str):
+        super().__init__(f"step {key} ({kind} {name!r}) is not in the journal")
+        self.key = key
+        self.kind = kind
+        self.name = name

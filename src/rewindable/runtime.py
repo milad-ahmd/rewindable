@@ -29,6 +29,7 @@ from .errors import (
     NonDeterminismError,
     RunLocked,
     Suspended,
+    Unrecorded,
     WorkflowNotFound,
 )
 from .store import Run, Store, dumps
@@ -126,6 +127,44 @@ class RunResult:
         return f"RunResult({', '.join(bits)})"
 
 
+@dataclass(frozen=True)
+class Waiting:
+    """Handed to ``Engine(on_waiting=...)`` once for every signal a run starts waiting on."""
+
+    run_id: str
+    workflow: str
+    key: str
+    prompt: str | None
+    approval: bool  # asked by ctx.approve, rather than ctx.wait_for
+    requested_at: float
+
+
+@dataclass
+class CheckResult:
+    """What :meth:`Engine.check` found when it replayed a run against the current code.
+
+    ``outcome`` is ``ok`` (every journaled step still lines up), ``diverged`` (the
+    code now calls something else at ``key``), ``failed`` (the workflow raised while
+    replaying) or ``unloadable`` (the workflow can no longer be imported).
+    """
+
+    run_id: str
+    workflow: str
+    status: str
+    outcome: str
+    replayed_steps: int = 0
+    resumes_at: str | None = None  # first key without a result: where a resume would continue
+    next_step: str | None = None  # what the code calls there
+    key: str | None = None  # where a diverged run stops matching
+    journal: str | None = None
+    code: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == "ok"
+
+
 class _Stats:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -138,7 +177,7 @@ class Context:
     """Handed to every workflow. Every call that has a side effect or costs money
     should go through it, so that it is journaled and replayed instead of repeated."""
 
-    def __init__(self, store: Store, run: Run, *, prefix: str = "", stats: _Stats | None = None):
+    def __init__(self, store: Store, run: Run, *, prefix: str = "", stats: _Stats | None = None, dry: bool = False):
         self._store = store
         self._run = run
         self._prefix = prefix
@@ -146,6 +185,9 @@ class Context:
         self._counter_lock = threading.Lock()
         self._local = threading.local()
         self._stats = stats or _Stats()
+        # A dry replay (Engine.check) only reads the journal: the first step it has
+        # no result for raises Unrecorded instead of running.
+        self._dry = dry
 
     @property
     def run_id(self) -> str:
@@ -170,7 +212,10 @@ class Context:
         if rec.name != name or rec.kind != kind:
             raise NonDeterminismError(
                 f"step {key} was {rec.kind} {rec.name!r} in the journal but the code now calls"
-                f" {kind} {name!r}. If you changed the workflow on purpose, rewind to step {key}."
+                f" {kind} {name!r}. If you changed the workflow on purpose, rewind to step {key}.",
+                key=key,
+                journal=rec.name if rec.kind == kind else f"{rec.kind} {rec.name}",
+                code=name if rec.kind == kind else f"{kind} {name}",
             )
         count, cost = 1, rec.cost_usd
         if kind == "parallel":  # the group's branches are skipped along with it
@@ -215,6 +260,8 @@ class Context:
         rec = self._replay(key, name, kind)
         if rec is not None:
             return rec.output
+        if self._dry:
+            raise Unrecorded(key, kind, name)
 
         if kind == "llm":
             self.budget_check()
@@ -316,6 +363,8 @@ class Context:
         rec = self._replay(key, name, "signal")
         if rec is not None:
             return rec.output
+        if self._dry:
+            raise Unrecorded(key, "signal", name)
         found = self._store.get_signal(self.run_id, signal)
         if found is not None and found.delivered_at is not None:
             payload = found.payload
@@ -375,6 +424,8 @@ class Context:
         key = self._next_key()
         if self._replay(key, name, "timer") is not None:
             return
+        if self._dry:
+            raise Unrecorded(key, "timer", name)
         rec = self._store.get_step(self.run_id, key)
         if rec is not None and rec.kind == "timer" and rec.status == "running" and isinstance(rec.output, dict):
             wake_at = float(rec.output["wake_at"])
@@ -412,6 +463,8 @@ class Context:
         rec = self._replay(key, name, "parallel")
         if rec is not None:
             return rec.output
+        if self._dry:
+            return self._dry_parallel(key, name, branches)
         self._store.begin_step(self.run_id, key, name, "parallel")
         if not branches:
             self._store.complete_step(self.run_id, key, [])
@@ -448,6 +501,61 @@ class Context:
             self._stats.executed += 1
         return results
 
+    def _dry_parallel(self, key: str, name: str, branches: Sequence[Callable[[Context], Any]]) -> list[Any]:
+        """Replay an unfinished group's branches one by one. A resume would re-run the
+        group, replaying what each branch journaled, so each branch is checked up to
+        its own first unrecorded step. Only if every branch replays to its end would
+        the group complete without running anything, and the replay goes on past it."""
+        results: list[Any] = []
+        first: Unrecorded | None = None
+        for index, branch in enumerate(branches):
+            child = Context(self._store, self._run, prefix=f"{key}.{index}.", stats=self._stats, dry=True)
+            try:
+                results.append(json.loads(dumps(branch(child))))
+            except Unrecorded as stop:
+                first = first or stop
+        if first is not None:
+            raise first
+        return results
+
+    # -- versioning ----------------------------------------------------------
+
+    def patched(self, change_id: str) -> bool:
+        """True if this run should take the new code path for ``change_id``.
+
+        Wrap a change to a workflow that has runs in flight::
+
+            if ctx.patched("eur-rounding"):
+                total = ctx.step("total-v2", ...)
+            else:
+                total = ctx.step("total", ...)
+
+        A run reaching this point for the first time records a marker step here and
+        gets True. A run whose journal already has a different step at this position
+        went past it on the old code, so it gets False and no key is used, which keeps
+        the old path's keys where they were. Once no such run is left, delete the old
+        branch but keep the call: runs that recorded the marker need it to line up.
+        """
+        if getattr(self._local, "in_step", False):
+            raise NestedStepError(f"patched({change_id!r}) was called inside a step")
+        name = f"patch:{change_id}"
+        with self._counter_lock:
+            key = f"{self._prefix}{self._counter + 1}"
+        rec = self._store.get_step(self.run_id, key)
+        if rec is not None and (rec.kind, rec.name, rec.status) != ("patch", name, "completed"):
+            return False
+        self._next_key()
+        if rec is not None:
+            self._replay(key, name, "patch")
+            return True
+        if self._dry:
+            raise Unrecorded(key, "patch", name)
+        self._store.begin_step(self.run_id, key, name, "patch")
+        self._store.complete_step(self.run_id, key, True)
+        with self._stats.lock:
+            self._stats.executed += 1
+        return True
+
     # -- deterministic helpers ---------------------------------------------
 
     def now(self) -> float:
@@ -467,9 +575,19 @@ class Engine:
     process (or ``rewindable worker``) can take over.
     """
 
-    def __init__(self, db: str | Path | None = None, *, store: Store | None = None, lease_ttl: float = 30.0):
+    def __init__(
+        self,
+        db: str | Path | None = None,
+        *,
+        store: Store | None = None,
+        lease_ttl: float = 30.0,
+        on_waiting: Callable[[Waiting], None] | None = None,
+    ):
         self.store = store or Store(db)
         self.lease_ttl = lease_ttl
+        # Called once per signal a run starts waiting on, after the run is saved
+        # and its lease released. Errors are printed to stderr, never raised.
+        self.on_waiting = on_waiting
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
     # -- lifecycle ---------------------------------------------------------
@@ -564,6 +682,36 @@ class Engine:
         """Answer ``ctx.approve``. Approving needs ``code`` once an approval code is set."""
         self.signal(run_id, key, {"approved": approved, "note": note}, code=code)
 
+    def check(self, run_id: str, workflow: Workflow | None = None) -> CheckResult:
+        """Replay a run against the current code without executing anything.
+
+        Every journaled step returns its recorded output; the first step the journal
+        has no result for ends the check, since that is where a resume would carry on.
+        No step function, model call, signal, timer or journal write happens. Use it
+        before deploying new code to find runs it would break with
+        :class:`NonDeterminismError`.
+        """
+        run = self.store.get_run(run_id)
+        result = CheckResult(run_id=run.id, workflow=run.workflow, status=run.status, outcome="ok")
+        try:
+            workflow = workflow or load_workflow(run.workflow)
+        except WorkflowNotFound as exc:
+            result.outcome, result.error = "unloadable", str(exc)
+            return result
+        stats = _Stats()
+        ctx = Context(self.store, run, stats=stats, dry=True)
+        try:
+            workflow(ctx, run.input) if _takes_input(workflow) else workflow(ctx)
+        except Unrecorded as stop:
+            result.resumes_at, result.next_step = stop.key, stop.name
+        except NonDeterminismError as exc:
+            result.outcome, result.error = "diverged", str(exc)
+            result.key, result.journal, result.code = exc.key, exc.journal, exc.code
+        except Exception as exc:  # noqa: BLE001 - reported, like a failed run
+            result.outcome, result.error = "failed", f"{type(exc).__name__}: {exc}"
+        result.replayed_steps = stats.replayed
+        return result
+
     # -- approval code -----------------------------------------------------
 
     @property
@@ -651,6 +799,7 @@ class Engine:
         heartbeat = threading.Thread(target=self._heartbeat, args=(run.id, stop), daemon=True)
         heartbeat.start()
         stats = _Stats()
+        waiting_on: list[str] = []
         try:
             ctx = Context(self.store, run, stats=stats)
             self.store.set_status(run.id, "running")
@@ -659,6 +808,7 @@ class Engine:
                 output = json.loads(dumps(value))
             except Suspended as suspended:
                 self.store.set_status(run.id, "waiting", wake_at=suspended.wake_at)
+                waiting_on = suspended.keys
             except Exception as exc:  # noqa: BLE001 - recorded in the journal
                 self.store.set_status(run.id, "failed", error=_format_exc(exc))
             else:
@@ -667,7 +817,24 @@ class Engine:
             stop.set()
             heartbeat.join()
             self.store.release_lease(run.id, self.owner)
+        if waiting_on:
+            self._notify(run, waiting_on)
         return self._result(self.store.get_run(run.id), stats)
+
+    def _notify(self, run: Run, keys: list[str]) -> None:
+        """Tell ``on_waiting`` about each signal the run waits on, once per signal ever.
+        It runs after the lease is released, so whoever answers can resume at once."""
+        if self.on_waiting is None:
+            return
+        for key in dict.fromkeys(keys):
+            signal = self.store.get_signal(run.id, key)
+            if signal is None or not signal.pending or not self.store.claim_notification(run.id, key):
+                continue
+            waiting = Waiting(run.id, run.workflow, key, signal.prompt, signal.approval, signal.requested_at or 0.0)
+            try:
+                self.on_waiting(waiting)
+            except Exception as exc:  # noqa: BLE001 - a notification never fails a run
+                print(f"rewindable: warning: could not notify about {run.id} {key}: {exc}", file=sys.stderr)
 
     def _heartbeat(self, run_id: str, stop: threading.Event) -> None:
         while not stop.wait(self.lease_ttl / 3):

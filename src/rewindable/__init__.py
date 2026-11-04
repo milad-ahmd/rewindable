@@ -5,6 +5,7 @@ Crash at step 7, resume, and steps 1-6 come back from the journal for free.
 """
 
 from .agent import Agent, AgentResult, Tool, tool
+from .diff import RunDiff, StepDiff, diff_runs
 from .errors import (
     ApprovalCodeError,
     BudgetExceeded,
@@ -16,10 +17,11 @@ from .errors import (
     WorkflowNotFound,
 )
 from .models import AnthropicModel, Model, OpenAICompatModel, ScriptedModel, call, calls, text_of
-from .runtime import Approval, Budget, Context, Engine, RunResult, StepInfo, current_step
+from .notify import webhook
+from .runtime import Approval, Budget, CheckResult, Context, Engine, RunResult, StepInfo, Waiting, current_step
 from .store import Store
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Agent",
@@ -29,6 +31,7 @@ __all__ = [
     "ApprovalCodeError",
     "Budget",
     "BudgetExceeded",
+    "CheckResult",
     "Context",
     "Engine",
     "Model",
@@ -36,17 +39,22 @@ __all__ = [
     "NonDeterminismError",
     "OpenAICompatModel",
     "RewindableError",
+    "RunDiff",
     "RunLocked",
     "RunNotFound",
     "RunResult",
     "ScriptedModel",
+    "StepDiff",
     "StepInfo",
     "Store",
     "Tool",
+    "Waiting",
     "WorkflowNotFound",
     "call",
     "calls",
     "current_step",
+    "diff_runs",
     "text_of",
     "tool",
+    "webhook",
 ]
